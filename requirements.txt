@@ -1,0 +1,6 @@
+streamlit>=1.36
+pandas>=2.0
+numpy
+openpyxl
+plotly
+python-docx
