@@ -6,6 +6,7 @@ y genera KPIs, flags de calidad y desgloses por distrito / encuestador / día.
 """
 
 import io
+import os
 import re
 import unicodedata
 from datetime import datetime
@@ -124,14 +125,11 @@ def flags_comunes(d: pd.DataFrame, f: pd.DataFrame) -> pd.DataFrame:
 
 def distinciones(d: pd.DataFrame) -> pd.DataFrame:
     """NO son errores: encuestas dejadas en borrador y complementadas por
-    teléfono después. Se reportan como característica del levantamiento."""
+    teléfono después. Se reportan como característica del levantamiento.
+    La fecha válida es siempre la registrada en Kobo ('Fecha de la
+    entrevista'); no se compara contra la fecha del dispositivo."""
     n = pd.DataFrame(index=d.index)
     n["Completada en borrador (>240 min)"] = (duracion_min(d) > 240).fillna(False)
-    fe = pd.to_datetime(col(d, "Fecha de la entrevista"), errors="coerce")
-    if resolve(d, "today", exact=True):
-        ty = pd.to_datetime(d["today"], errors="coerce")
-        n["Enviada en fecha distinta a la entrevista"] = (
-            fe.notna() & ty.notna() & (fe.dt.date != ty.dt.date)).fillna(False)
     return n
 
 
@@ -263,6 +261,65 @@ def flags_cultivo(r: pd.DataFrame) -> pd.DataFrame:
 
 
 # ----------------------------------------------------------------------------
+# Diccionario de flags (explicación para el equipo)
+# ----------------------------------------------------------------------------
+FLAG_DESC = {
+    # Comunes a ambos módulos
+    "G01 Duración <15 min": "El tiempo entre que se abrió y se envió el formulario fue menor a 15 minutos. Una encuesta completa difícilmente se levanta tan rápido, así que puede estar incompleta o haberse llenado sin entrevistar realmente. Verificar con el encuestador si fue un reinicio o una prueba.",
+    "G02 Fecha de entrevista vacía": "El campo 'Fecha de la entrevista' quedó sin llenar en Kobo. Esa fecha es la que usa el dashboard para medir el avance por día, así que sin ella la encuesta no aparece en la gráfica diaria. Pedir al encuestador que la complete.",
+    "G03 Nombre de prueba": "El nombre del encuestado es un texto de prueba ('NOMBRE', 'PRUEBA', 'TEST', etc.). Casi seguro es un registro de práctica o capacitación que quedó en la base. Confirmar y eliminarlo antes del análisis.",
+    # SCALL
+    "F01 Teléfono inválido": "El número de teléfono tiene letras, símbolos o más de 8 dígitos (el estándar en El Salvador es de 8). Un teléfono mal capturado impide recontactar al productor para verificaciones o para complementar datos por llamada.",
+    "F02 Hogar >10 personas": "El hogar reporta más de 10 miembros, un tamaño poco común. Puede ser real, pero también un error de dedo (ej. 12 en vez de 2). Confirmar el dato con el productor.",
+    "F03 Mujeres > total": "El número de mujeres reportado es mayor que el total de personas del hogar, lo cual es imposible. Alguno de los dos números quedó mal capturado y hay que corregirlo.",
+    "F04 Hombres+Mujeres ≠ Total": "La suma de hombres más mujeres no coincide con el total de miembros del hogar. Indica error de captura o de conteo en alguno de los tres campos; revisar cuál es el correcto.",
+    "F05 Ayudantes > total hogar": "Se reportan más miembros ayudando en las actividades productivas que personas viviendo en el hogar. Es una inconsistencia lógica que requiere verificar ambos números.",
+    "F06 Año SCALL < 2020": "El año de instalación del sistema de captación es anterior a 2020, antes del periodo esperado de entregas del proyecto. Puede tratarse de un sistema previo (no de RECLIMA) o de un año mal recordado o mal digitado.",
+    "F07 Tiempo acarreo sospechoso": "El tiempo de ida y vuelta para acarrear agua antes del proyecto es menor a 10 minutos o mayor a 4 horas. Los extremos suelen ser errores de unidad (horas vs. minutos) o estimaciones poco fiables.",
+    "F08 Días agua >30": "Se reportan más de 30 días con agua disponible en el último mes, cuando el máximo posible es 30-31. Es un error de captura o de interpretación de la pregunta.",
+    "F09 Litros SCALL >10,000": "El aporte anual de agua reportado supera los 10,000 litros, muy por encima de la capacidad típica de un SCALL domiciliar. Probable error de unidad o estimación exagerada.",
+    "F10 Meses fuera 0-12": "Los meses al año que el SCALL aporta agua están fuera del rango 0 a 12, lo cual es imposible. Corregir el dato con el productor.",
+    "F11 Tiempo actual sospechoso": "El tiempo actual de ida y vuelta para conseguir agua fuera del hogar es menor a 5 minutos o mayor a 24 horas. Los extremos sugieren error de unidad o de digitación.",
+    "F12 Gasto agua atípico": "El gasto mensual en compra o transporte de agua es menor a $1 o mayor a $1,000. Montos así de extremos casi siempre son errores de captura (ej. centavos vs. dólares).",
+    "F13 Almacenamiento <100 L": "La capacidad total de almacenamiento reportada es menor a 100 litros, muy por debajo de cualquier tanque SCALL real. Probable error de unidad o dato incompleto.",
+    "F14 Gasto mant. atípico": "El gasto anual en mantenimiento es menor a $10 o mayor a $10,000. Fuera de ese rango lo esperable es un error de digitación o una interpretación distinta de la pregunta.",
+    "F15 Días tanque lleno >365": "Los días que duraría un tanque lleno superan los 365, es decir más de un año con una sola llenada, lo cual no es plausible. Revisar si el productor entendió la pregunta.",
+    "F16 Centinela 9999/999 sin depurar": "El registro contiene códigos 9999 o 999 que significan 'no sabe / no responde' en campos numéricos (tanque, tiempo, almacenamiento, días fuera de servicio). No son valores reales: hay que depurarlos antes de calcular promedios o totales.",
+    # Agrícola
+    "F02 Edad atípica": "La edad del productor es menor a 15 o mayor a 100 años. Puede ser un error de dedo o que se registró a la persona equivocada como productor principal.",
+    "F03 Hogar >15 personas": "El hogar reporta más de 15 miembros, un tamaño excepcional. Puede ser real, pero conviene confirmar que no sea un error de captura.",
+    "F04 Gasto semilla >$5,000": "El gasto en semilla supera los $5,000 en la temporada, muy alto para un pequeño productor. Verificar si es real (productor grande) o un error de monto.",
+    "F05 Gasto fertilizantes >$5,000": "El gasto en fertilizantes supera los $5,000 en la temporada. Igual que con semilla: puede ser real en casos excepcionales, pero lo usual es un error de captura.",
+    "F06 Gasto agroquímicos >$5,000": "El gasto en agroquímicos (sin contar fertilizantes) supera los $5,000. Es un monto atípico para la escala de los beneficiarios; confirmar con el productor.",
+    "F07 Gasto mano obra >$10,000": "El gasto en jornales o mano de obra contratada supera los $10,000 en la temporada. Verificar unidad y monto con el encuestador.",
+    "F08 Ingreso ventas >$50,000": "El ingreso por venta de cultivos supera los $50,000, fuera de la escala esperada de los beneficiarios. Puede ser un error de digitación (un cero de más).",
+    "F09 Ingresos >> gastos x10": "El ingreso por ventas es más de 10 veces la suma de todos los gastos productivos. Una rentabilidad así de alta es improbable y sugiere que algún monto (ingreso o gastos) está mal capturado.",
+    "F10 Más parcelas que cultivos": "Se reportan más parcelas que cultivos en total, lo que implicaría parcelas enteras sin ningún cultivo. Es posible, pero conviene confirmar que no se invirtieron los dos números.",
+    "F11 Centinela 9999 en gastos/ingreso": "Algún campo de gastos o de ingreso tiene el código 9999 que significa 'no sabe'. No es un monto real: hay que depurarlo antes de sumar o promediar y, de ser posible, recuperar el dato con el productor.",
+    # Parcelas
+    "P01 Área parcela = 0": "La parcela tiene área cero o negativa, lo cual no es posible si se cultivó en ella. Falta el dato real de superficie; recuperarlo con el encuestador.",
+    "P02 Área parcela >500 mz": "La parcela supera las 500 manzanas, una extensión enorme para el perfil de los beneficiarios. Casi seguro es un error de unidad o de digitación.",
+    "P03 Árboles plantados > existentes": "Se reportan más árboles plantados en los últimos 12 meses que árboles existentes en total en la parcela. Como los plantados deberían estar incluidos en los existentes, hay una inconsistencia que revisar.",
+    "P04 Qty fertilizante = 9999": "La cantidad de fertilizante tiene el código 9999 de 'no sabe'. Depurar antes de usar el dato y, si se puede, recuperarlo con el productor.",
+    "P05 Qty agroquímico = 9999": "La cantidad de agroquímico tiene el código 9999 de 'no sabe'. Depurar antes de usar el dato y, si se puede, recuperarlo con el productor.",
+    # Cultivos
+    "C01 Cosechada > Sembrada": "El área cosechada es mayor que el área sembrada (medidas en la misma unidad), lo cual no es posible. Uno de los dos valores está mal capturado.",
+    "C02 Producción=0, área>0": "Se sembró un área mayor a cero pero la producción reportada es cero. Puede ser una pérdida total real (sequía, plaga) o un dato faltante; conviene confirmar cuál de las dos.",
+    "C03 Qty semilla = 9999": "La cantidad de semilla tiene el código 9999 de 'no sabe'. No es un valor real; depurar y de ser posible recuperar el dato.",
+    "C04 Área sembrada >500 mz": "El área sembrada del cultivo supera las 500 manzanas, fuera de toda escala esperada. Error de unidad o de digitación casi seguro.",
+}
+
+
+def diccionario_flags(nombres):
+    con_desc = [(n, FLAG_DESC[n]) for n in nombres if n in FLAG_DESC]
+    if not con_desc:
+        return
+    with st.expander("ℹ️ ¿Qué significa cada flag? (guía para el equipo)"):
+        for nombre, desc in con_desc:
+            st.markdown(f"**{nombre}** — {desc}")
+
+
+# ----------------------------------------------------------------------------
 # Render del dashboard
 # ----------------------------------------------------------------------------
 CHART = dict(height=340)
@@ -324,9 +381,60 @@ def kpis_y_desgloses(d: pd.DataFrame, flags: pd.DataFrame, notas: pd.DataFrame):
     if fechas.notna().any():
         por_dia = fechas.dt.date.value_counts().sort_index()
         fig = px.bar(por_dia, labels={"value": "Encuestas", "index": "Día"},
-                     title="Encuestas por día", height=300)
+                     title="Encuestas por día (según fecha registrada en Kobo)", height=300)
         fig.update_layout(showlegend=False)
         st.plotly_chart(fig, width="stretch")
+
+
+def _pct(serie: pd.Series, condicion) -> str:
+    """% de casos que cumplen la condición, sobre los que respondieron."""
+    v = serie.dropna().astype(str).str.strip()
+    v = v[v != ""]
+    if v.empty:
+        return "—"
+    return f"{condicion(v).mean():.0%}"
+
+
+def seccion_preliminares(d: pd.DataFrame, modulo: str):
+    st.subheader("🧪 Datos preliminares (resultados)")
+    st.caption("Calculados sobre la base tal como está — sin depuración final ni "
+               "ponderación. Referencia de avance, no resultados de la evaluación.")
+    c1, c2, c3, c4 = st.columns(4)
+    if modulo == "SCALL":
+        c1.metric("Hogares que usan agua del SCALL",
+                  _pct(col(d, "el hogar usa agua del SCALL"),
+                       lambda v: v.str.startswith("Sí")))
+        meses = skip(col(d, ["cuantos meses aporta agua",
+                             "meses al año su scall aporta"]), 99)
+        c2.metric("Meses al año que aporta agua (prom.)",
+                  f"{meses.mean():.1f}" if meses.notna().any() else "—")
+        c3.metric("Perciben mejor disponibilidad de agua",
+                  _pct(col(d, "la disponibilidad de agua para beber es"),
+                       lambda v: v.isin(["Mejor", "Mucho mejor"])))
+        c4.metric("Creen que funcionará en 2 años",
+                  _pct(col(d, "seguira funcionando dentro de 2"),
+                       lambda v: v == "Sí"))
+    else:
+        c1.metric("Productoras mujeres",
+                  _pct(col(d, "sexo del productor"), lambda v: v == "Mujer"))
+        parc = num(col(d, "TERRENOS o PARCELAS"))
+        cult = num(col(d, "CULTIVOS tuvo en total"))
+        c2.metric("Parcelas / cultivos por productor (prom.)",
+                  f"{parc.mean():.1f} / {cult.mean():.1f}"
+                  if parc.notna().any() else "—")
+        ing = skip(col(d, "ingreso total obtenido por la venta"), 9999)
+        c3.metric("Vendieron parte de su cosecha",
+                  f"{(ing > 0).sum() / ing.notna().sum():.0%}"
+                  if ing.notna().any() else "—")
+        fuente = col(d, "principal fuente de ingresos").dropna().astype(str)
+        if len(fuente):
+            top = fuente.value_counts()
+            c4.metric("Principal fuente de ingresos (moda)",
+                      top.index[0],
+                      f"{top.iloc[0] / len(fuente):.0%} de los hogares",
+                      delta_color="off")
+        else:
+            c4.metric("Principal fuente de ingresos (moda)", "—")
 
 
 def tabla_flags(d: pd.DataFrame, flags: pd.DataFrame):
@@ -447,6 +555,12 @@ def render_modulo(book: dict, esperado: str, nombre: str):
     flags = flags_scall(d) if esperado == "SCALL" else flags_agricola(d)
     notas = distinciones(d)
     kpis_y_desgloses(d, flags, notas)
+    seccion_preliminares(d, esperado)
+    nombres_flags = list(flags.columns)
+    if esperado == "AGRICOLA":
+        nombres_flags += [n for n in FLAG_DESC
+                          if n[:1] in ("P", "C") and n[1:3].isdigit()]
+    diccionario_flags(nombres_flags)
     tabla_flags(d, flags)
     if esperado == "AGRICOLA":
         st.divider()
@@ -550,6 +664,12 @@ def reporte_acumulado_docx(d: pd.DataFrame, flags: pd.DataFrame,
                 afectados.append(f"{p} ({e})" if e else str(p))
             filas.append((flag_name, int(n), "; ".join(map(str, afectados))))
         _doc_tabla(doc, filas, ["Flag", "Casos", "Productores afectados (encuestador)"])
+        doc.add_paragraph("Descripción de los flags activos:", style="Intense Quote")
+        for flag_name in resumen.index:
+            if flag_name in FLAG_DESC:
+                p = doc.add_paragraph()
+                p.add_run(flag_name + ": ").bold = True
+                p.add_run(FLAG_DESC[flag_name])
     if extra:
         doc.add_paragraph(extra)
 
@@ -603,25 +723,49 @@ def seccion_reporte(d: pd.DataFrame, flags: pd.DataFrame, notas: pd.DataFrame,
 
 
 # ----------------------------------------------------------------------------
+# Datos publicados por el administrador (carpeta data/ del repo de GitHub)
+# ----------------------------------------------------------------------------
+DATA_DIR = "data"
+ARCHIVO_PUBLICADO = {"SCALL": "scall.xlsx", "AGRICOLA": "agricola.xlsx"}
+
+
+@st.cache_data(show_spinner=False)
+def libro_publicado(nombre_archivo: str, mtime: float):
+    """Carga la base publicada en el repo. `mtime` invalida el caché al actualizar."""
+    with open(os.path.join(DATA_DIR, nombre_archivo), "rb") as fh:
+        return load_book(fh.read())
+
+
+def pestana_modulo(esperado: str, nombre: str, key: str):
+    publicado = os.path.join(DATA_DIR, ARCHIVO_PUBLICADO[esperado])
+    with st.expander("🔄 Ver otra base (opcional — no reemplaza la publicada)"):
+        up = st.file_uploader(f"Base {nombre} (.xlsx)", type="xlsx", key=f"up_{key}")
+    if up:
+        st.caption("Mostrando la base subida en esta sesión (no queda guardada).")
+        render_modulo(load_book(up.getvalue()), esperado, nombre)
+    elif os.path.exists(publicado):
+        mt = os.path.getmtime(publicado)
+        st.caption(f"📌 Base publicada por el administrador — actualizada el "
+                   f"{datetime.fromtimestamp(mt):%d/%m/%Y %H:%M}.")
+        render_modulo(libro_publicado(ARCHIVO_PUBLICADO[esperado], mt), esperado, nombre)
+    else:
+        st.info(f"Aún no hay base publicada para {nombre}. El administrador debe subir "
+                f"`data/{ARCHIVO_PUBLICADO[esperado]}` al repo de GitHub, o puedes subir "
+                "un archivo en la sección de arriba para verlo en esta sesión.")
+
+
+# ----------------------------------------------------------------------------
 # App
 # ----------------------------------------------------------------------------
 if check_password():
     st.title("🌱 Dashboard de monitoreo RECLIMA")
     st.caption("Evaluación final — corredor seco de El Salvador. "
-               "Sube la exportación .xlsx de KoboToolbox (o el archivo de monitoreo) en la pestaña del módulo.")
+               "Los datos los publica el administrador; se actualizan automáticamente.")
 
     tab_scall, tab_agri = st.tabs(["💧 SCALL", "🌾 Agrícola"])
 
     with tab_scall:
-        up = st.file_uploader("Base SCALL (.xlsx)", type="xlsx", key="up_scall")
-        if up:
-            render_modulo(load_book(up.getvalue()), "SCALL", "SCALL")
-        else:
-            st.info("Sube la base para generar el dashboard.")
+        pestana_modulo("SCALL", "SCALL", "scall")
 
     with tab_agri:
-        up = st.file_uploader("Base Agrícola (.xlsx)", type="xlsx", key="up_agri")
-        if up:
-            render_modulo(load_book(up.getvalue()), "AGRICOLA", "Agrícola")
-        else:
-            st.info("Sube la base para generar el dashboard.")
+        pestana_modulo("AGRICOLA", "Agrícola", "agri")
