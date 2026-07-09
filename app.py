@@ -111,10 +111,24 @@ def duracion_min(d: pd.DataFrame) -> pd.Series:
     return pd.Series(np.nan, index=d.index)
 
 
+# La variable de identificación oficial es PRODUCTOS-ID ENCUESTA
+# ("Identificador de encuestado" en la exportación). Si está vacía, se usa
+# el índice de Kobo como respaldo, marcado con "k".
+K_ID = ["PRODUCTOS-ID ENCUESTA", "PRODUCTOS-ID", "ID ENCUESTA",
+        "Identificador de encuestado"]
+
+
 def id_encuesta(d: pd.DataFrame) -> pd.Series:
-    """ID para rastrear el registro en Kobo (sin datos personales)."""
+    """ID para rastrear el registro (sin datos personales)."""
     idx_c = resolve(d, "_index", exact=True)
-    return d[idx_c].astype("Int64").astype(str) if idx_c else (d.index + 1).astype(str)
+    kobo = (d[idx_c].astype("Int64").astype(str) if idx_c
+            else (d.index + 1).astype(str))
+    id_c = resolve(d, K_ID)
+    if id_c is not None:
+        ids = d[id_c].astype(str).str.strip()
+        sin_id = ids.isin(["", "nan", "None"])
+        return ids.mask(sin_id, "s/ID·k" + kobo)
+    return kobo
 
 
 # ----------------------------------------------------------------------------
@@ -554,7 +568,16 @@ def seccion_faltantes(d: pd.DataFrame, claves, modulo: str):
         b.dataframe(t2, width="stretch")
 
 
-def seccion_mapa(d: pd.DataFrame):
+ESTILOS_MAPA = {"⬜ Blanco": "white-bg", "🩶 Claro": "carto-positron",
+                "🗺 Calles": "open-street-map"}
+
+
+def selector_estilo(key: str) -> str:
+    op = st.radio("Fondo del mapa", list(ESTILOS_MAPA), horizontal=True, key=key)
+    return ESTILOS_MAPA[op]
+
+
+def seccion_mapa(d: pd.DataFrame, modulo: str = ""):
     """Mapa de puntos GPS para control de calidad de campo. Los puntos se
     identifican SOLO por ID (sin nombres). Uso interno del equipo."""
     lat_c = resolve(d, "_latitude")
@@ -579,17 +602,18 @@ def seccion_mapa(d: pd.DataFrame):
     if fuera.any():
         st.warning("⚠ Punto(s) fuera de El Salvador — revisar GPS: IDs "
                    + ", ".join("#" + i for i in pts.loc[fuera, "ID"]))
+    estilo = selector_estilo(f"estilo_pts_{modulo}")
     try:
         fig = px.scatter_map(pts, lat="lat", lon="lon", color="Encuestador",
                              hover_name="ID", hover_data={"lat": False, "lon": False,
                                                           "Distrito": True},
                              zoom=8, height=480)
-        fig.update_layout(map_style="open-street-map",
+        fig.update_layout(map_style=estilo,
                           margin=dict(l=0, r=0, t=10, b=0))
     except Exception:  # versiones previas de plotly
         fig = px.scatter_mapbox(pts, lat="lat", lon="lon", color="Encuestador",
                                 hover_name="ID", zoom=8, height=480)
-        fig.update_layout(mapbox_style="open-street-map",
+        fig.update_layout(mapbox_style=estilo,
                           margin=dict(l=0, r=0, t=10, b=0))
     fig.update_traces(marker=dict(size=10))
     st.plotly_chart(fig, width="stretch")
@@ -700,6 +724,7 @@ def seccion_poligonos(d: pd.DataFrame, book: dict):
 
     import plotly.graph_objects as go
     usa_map = hasattr(go, "Scattermap")
+    estilo = selector_estilo("estilo_poly")
     fig = go.Figure()
     for pid, pts in shapes:
         lats = [p[0] for p in pts] + [pts[0][0]]
@@ -711,14 +736,37 @@ def seccion_poligonos(d: pd.DataFrame, book: dict):
     todas_lon = [p[1] for _, pts in shapes for p in pts]
     centro = dict(lat=float(np.mean(todas_lat)), lon=float(np.mean(todas_lon)))
     if usa_map:
-        fig.update_layout(map=dict(style="open-street-map", center=centro, zoom=13),
+        fig.update_layout(map=dict(style=estilo, center=centro, zoom=13),
                           height=500, margin=dict(l=0, r=0, t=10, b=0))
     else:
-        fig.update_layout(mapbox=dict(style="open-street-map", center=centro, zoom=13),
+        fig.update_layout(mapbox=dict(style=estilo, center=centro, zoom=13),
                           height=500, margin=dict(l=0, r=0, t=10, b=0))
     st.plotly_chart(fig, width="stretch")
-    st.caption("Consejo: acerque el zoom sobre cada polígono para verificar su "
-               "forma. Un polígono válido debe cerrar sobre sí mismo y tener un "
+
+    # Visor de polígono individual
+    st.markdown("**🔎 Ver el polígono de una observación**")
+    opciones = [pid for pid, _ in shapes]
+    sel = st.selectbox("Seleccione la encuesta (ID)", opciones, key="poly_sel")
+    pts_sel = dict(shapes)[sel]
+    fila_sel = next(r for r in regs if r["ID"] == sel)
+    st.dataframe(pd.DataFrame([fila_sel]), hide_index=True, width="stretch")
+    lats = [p[0] for p in pts_sel] + [pts_sel[0][0]]
+    lons = [p[1] for p in pts_sel] + [pts_sel[0][1]]
+    tr = dict(lat=lats, lon=lons, mode="lines+markers", fill="toself",
+              name=f"#{sel}", hovertext=f"ID #{sel}")
+    fig2 = go.Figure(go.Scattermap(**tr) if usa_map else go.Scattermapbox(**tr))
+    centro2 = dict(lat=float(np.mean([p[0] for p in pts_sel])),
+                   lon=float(np.mean([p[1] for p in pts_sel])))
+    if usa_map:
+        fig2.update_layout(map=dict(style=estilo, center=centro2, zoom=17),
+                           height=450, margin=dict(l=0, r=0, t=10, b=0),
+                           showlegend=False)
+    else:
+        fig2.update_layout(mapbox=dict(style=estilo, center=centro2, zoom=17),
+                           height=450, margin=dict(l=0, r=0, t=10, b=0),
+                           showlegend=False)
+    st.plotly_chart(fig2, width="stretch")
+    st.caption("Un polígono válido debe cerrar sobre sí mismo y tener un "
                "área coherente con lo reportado.")
 
 
@@ -752,9 +800,13 @@ def ficha_encuestado(d: pd.DataFrame, flags: pd.DataFrame, book: dict = None,
                "nombres, teléfonos, direcciones y coordenadas están excluidos "
                "del tablero; consúltelos directamente en Kobo si es necesario.")
     ids = id_encuesta(d)
-    elegido = st.selectbox("Seleccione la encuesta por ID",
-                           "ID " + ids, key=f"ficha_{modulo}")
-    i = ids.index[("ID " + ids) == elegido][0]
+    idx_c0 = resolve(d, "_index", exact=True)
+    kobo = (d[idx_c0].astype("Int64").astype(str) if idx_c0
+            else (d.index + 1).astype(str))
+    etiquetas = ids.where(ids.str.startswith("s/ID"), ids + " · k" + kobo)
+    elegido = st.selectbox("Seleccione la encuesta por ID (PRODUCTOS-ID ENCUESTA)",
+                           etiquetas, key=f"ficha_{modulo}")
+    i = etiquetas.index[etiquetas == elegido][0]
     fila = quitar_sensibles(d).loc[i]
 
     activos = [f for f in flags.columns if flags.at[i, f]]
@@ -841,7 +893,7 @@ def render_modulo(book: dict, esperado: str, nombre: str):
     diccionario_flags(nombres_flags)
     tabla_flags(d, flags)
     seccion_faltantes(d, claves, esperado)
-    seccion_mapa(d)
+    seccion_mapa(d, esperado)
     if esperado == "AGRICOLA":
         st.divider()
         seccion_roster(book, d, "roster_parcela", flags_parcela,
