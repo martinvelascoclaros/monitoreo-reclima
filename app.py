@@ -125,9 +125,11 @@ def id_encuesta(d: pd.DataFrame) -> pd.Series:
             else (d.index + 1).astype(str))
     id_c = resolve(d, K_ID)
     if id_c is not None:
-        ids = d[id_c].astype(str).str.strip()
-        sin_id = ids.isin(["", "nan", "None"])
-        return ids.mask(sin_id, "s/ID·k" + kobo)
+        raw = d[id_c]
+        txt = raw.astype(str).str.strip()
+        # raw.isna() cubre pandas 3 (los NaN ya no se vuelven texto "nan")
+        sin_id = raw.isna() | txt.isin(["", "nan", "None", "<NA>"])
+        return txt.mask(sin_id, "s/ID·k" + kobo).astype(str)
     return kobo
 
 
@@ -750,7 +752,7 @@ def seccion_poligonos(d: pd.DataFrame, book: dict):
     if sel not in dict(shapes):  # selección de una base anterior
         sel = opciones[0]
     pts_sel = dict(shapes)[sel]
-    fila_sel = next(r for r in regs if r["ID"] == sel)
+    fila_sel = next((r for r in regs if r["ID"] == sel), regs[0])
     st.dataframe(pd.DataFrame([fila_sel]), hide_index=True, width="stretch")
     lats = [p[0] for p in pts_sel] + [pts_sel[0][0]]
     lons = [p[1] for p in pts_sel] + [pts_sel[0][1]]
