@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """
 Dashboard de monitoreo RECLIMA — SCALL y Agrícola
-Streamlit app: sube la exportación .xlsx (Kobo/ODK o el archivo de monitoreo)
-y genera KPIs, flags de calidad y desgloses por distrito / encuestador / día.
+Publica los datos el administrador (carpeta data/ del repo); el equipo
+consulta con enlace + contraseña. El tablero NO muestra datos personales
+de los entrevistados (solicitud FAO): solo el ID de Kobo (_index).
 """
 
 import io
@@ -49,9 +50,8 @@ def _norm(s: str) -> str:
 
 
 def resolve(df: pd.DataFrame, key, exact: bool = False):
-    """Devuelve la primera columna que coincide (exacto primero, luego subcadena,
-    sin acentos ni mayúsculas). `key` puede ser una cadena o una lista de
-    alternativas (para soportar distintas versiones del cuestionario)."""
+    """Primera columna que coincide (exacto primero, luego subcadena, sin
+    acentos ni mayúsculas). `key` puede ser cadena o lista de alternativas."""
     keys = [key] if isinstance(key, str) else list(key)
     for k in keys:
         nk = _norm(k)
@@ -75,7 +75,6 @@ K_NOMBRE = ["nombre completo del productor",
 
 
 def col(df, key, exact=False):
-    """Serie de la columna resuelta, o serie de NaN si no existe."""
     c = resolve(df, key, exact)
     if c is None:
         return pd.Series(np.nan, index=df.index)
@@ -87,7 +86,6 @@ def num(s: pd.Series) -> pd.Series:
 
 
 def skip(s: pd.Series, *sentinels) -> pd.Series:
-    """NaN donde el valor es vacío o centinela (9, 99, 9999...)."""
     n = num(s)
     for v in sentinels:
         n = n.mask(n == v)
@@ -113,21 +111,88 @@ def duracion_min(d: pd.DataFrame) -> pd.Series:
     return pd.Series(np.nan, index=d.index)
 
 
-def flags_comunes(d: pd.DataFrame, f: pd.DataFrame) -> pd.DataFrame:
-    """Flags aplicables a cualquier módulo (v2/v3)."""
+def id_encuesta(d: pd.DataFrame) -> pd.Series:
+    """ID para rastrear el registro en Kobo (sin datos personales)."""
+    idx_c = resolve(d, "_index", exact=True)
+    return d[idx_c].astype("Int64").astype(str) if idx_c else (d.index + 1).astype(str)
+
+
+# ----------------------------------------------------------------------------
+# Protección de datos personales (solicitud FAO): el tablero solo muestra el
+# ID de Kobo; nombres, teléfonos, direcciones y coordenadas se excluyen.
+# ----------------------------------------------------------------------------
+PATRON_SENSIBLE = re.compile(
+    r"nombre|telefono|celular|correo|contacto|domicilio|direccion|geoloc"
+    r"|latitud|longitud|latitude|longitude|altitude|precision|gps|poligono|polygon|shape",
+    re.I)
+
+
+def es_sensible(nombre_col: str) -> bool:
+    n = _norm(str(nombre_col))
+    if "encuestador" in n or "supervisor" in n or "enumerador" in n:
+        return False  # personal de campo, no beneficiarios
+    return bool(PATRON_SENSIBLE.search(n))
+
+
+def quitar_sensibles(df: pd.DataFrame) -> pd.DataFrame:
+    return df[[c for c in df.columns if not es_sensible(c)]]
+
+
+# ----------------------------------------------------------------------------
+# Preguntas clave para el análisis de valores faltantes
+# ----------------------------------------------------------------------------
+CLAVES_SCALL = [
+    ("Fecha de la entrevista", "Fecha de la entrevista"),
+    ("Distrito", "Distrito"),
+    ("Miembros del hogar", "personas habitan al dia de hoy"),
+    ("Mujeres en el hogar", "cuantas son mujeres"),
+    ("Año de instalación del SCALL", "año que le instalaron"),
+    ("Uso actual del agua del SCALL", "el hogar usa agua del SCALL"),
+    ("Meses al año que aporta agua", ["cuantos meses aporta agua", "meses al año su scall aporta"]),
+    ("Capacidad de almacenamiento", "capacidad total de almacenamiento"),
+    ("Gasto en mantenimiento", "gasto estimado en mantenimiento"),
+]
+CLAVES_AGRI = [
+    ("Fecha de la entrevista", "Fecha de la entrevista"),
+    ("Distrito", "Distrito"),
+    ("Edad del productor", "edad del productor"),
+    ("Miembros del hogar", "personas habitan al dia de hoy"),
+    ("N.º de parcelas", "TERRENOS o PARCELAS"),
+    ("N.º de cultivos", "CULTIVOS tuvo en total"),
+    ("Gasto en semilla", "compra de la SEMILLA"),
+    ("Gasto en fertilizantes", "compra de FERTILIZANTES"),
+    ("Ingreso por ventas", "ingreso total obtenido por la venta"),
+    ("Fuente principal de ingresos", "principal fuente de ingresos"),
+]
+
+
+def vacios(serie: pd.Series) -> pd.Series:
+    return serie.isna() | serie.astype(str).str.strip().isin(["", "nan", "None"])
+
+
+def faltantes_por_fila(d: pd.DataFrame, claves) -> pd.Series:
+    cols = [resolve(d, k) for _, k in claves]
+    cols = [c for c in cols if c is not None]
+    if not cols:
+        return pd.Series(0, index=d.index)
+    return pd.concat([vacios(d[c]) for c in cols], axis=1).sum(axis=1)
+
+
+def flags_comunes(d: pd.DataFrame, f: pd.DataFrame, claves=None) -> pd.DataFrame:
+    """Flags aplicables a cualquier módulo."""
     f["G01 Duración <15 min"] = duracion_min(d) < 15
     fe = pd.to_datetime(col(d, "Fecha de la entrevista"), errors="coerce")
     f["G02 Fecha de entrevista vacía"] = fe.isna()
     nom = col(d, K_NOMBRE).astype(str).str.strip().str.upper()
     f["G03 Nombre de prueba"] = nom.isin(["NOMBRE", "PRUEBA", "TEST", "XXX", "N/A"])
+    if claves:
+        f["G04 ≥3 preguntas clave sin dato"] = faltantes_por_fila(d, claves) >= 3
     return f
 
 
 def distinciones(d: pd.DataFrame) -> pd.DataFrame:
     """NO son errores: encuestas dejadas en borrador y complementadas por
-    teléfono después. Se reportan como característica del levantamiento.
-    La fecha válida es siempre la registrada en Kobo ('Fecha de la
-    entrevista'); no se compara contra la fecha del dispositivo."""
+    teléfono. La fecha válida es siempre la registrada en Kobo."""
     n = pd.DataFrame(index=d.index)
     n["Completada en borrador (>240 min)"] = (duracion_min(d) > 240).fillna(False)
     return n
@@ -164,7 +229,7 @@ def detect_module(book: dict):
 
 
 # ----------------------------------------------------------------------------
-# Definición de flags (replican y extienden las fórmulas del Excel de monitoreo)
+# Definición de flags
 # ----------------------------------------------------------------------------
 def flags_scall(d: pd.DataFrame) -> pd.DataFrame:
     an = num(col(d, "personas habitan al dia de hoy"))
@@ -191,7 +256,6 @@ def flags_scall(d: pd.DataFrame) -> pd.DataFrame:
     f["F13 Almacenamiento <100 L"] = (cg > 0) & (cg < 100)
     ct = num(col(d, "gasto estimado en mantenimiento"))
     f["F14 Gasto mant. atípico"] = (ct > 0) & ((ct < 10) | (ct > 10000))
-    # v3 (jun 2026)
     f["F15 Días tanque lleno >365"] = skip(col(d, "dias le duraria un tanque lleno"), 9999) > 365
     f["F16 Centinela 9999/999 sin depurar"] = (
         (num(col(d, "dias le duraria un tanque lleno")) == 9999)
@@ -199,7 +263,7 @@ def flags_scall(d: pd.DataFrame) -> pd.DataFrame:
         | (num(col(d, "capacidad total de almacenamiento")).isin([9999, 999]))
         | (num(col(d, "dias estuvo fuera de servicio")) == 999)
     )
-    return flags_comunes(d, f).fillna(False)
+    return flags_comunes(d, f, CLAVES_SCALL).fillna(False)
 
 
 def flags_agricola(d: pd.DataFrame) -> pd.DataFrame:
@@ -209,7 +273,7 @@ def flags_agricola(d: pd.DataFrame) -> pd.DataFrame:
     ga_raw = num(col(d, "AGROQUIMICOS"))
     gm_raw = num(col(d, "mano de obra o jornales"))
     ing_raw = num(col(d, "ingreso total obtenido por la venta"))
-    # 9999 es centinela de "no sabe": no debe contar como gasto/ingreso real
+    # 9999 es centinela de "no sabe": no cuenta como monto real
     gs, gf, ga = gs_raw.mask(gs_raw == 9999), gf_raw.mask(gf_raw == 9999), ga_raw.mask(ga_raw == 9999)
     gm, ing = gm_raw.mask(gm_raw == 9999), ing_raw.mask(ing_raw == 9999)
     gastos = gs.fillna(0) + gf.fillna(0) + ga.fillna(0) + gm.fillna(0)
@@ -229,7 +293,7 @@ def flags_agricola(d: pd.DataFrame) -> pd.DataFrame:
     f["F11 Centinela 9999 en gastos/ingreso"] = (
         (gs_raw == 9999) | (gf_raw == 9999) | (ga_raw == 9999)
         | (gm_raw == 9999) | (ing_raw == 9999))
-    return flags_comunes(d, f).fillna(False)
+    return flags_comunes(d, f, CLAVES_AGRI).fillna(False)
 
 
 def flags_parcela(r: pd.DataFrame) -> pd.DataFrame:
@@ -264,45 +328,41 @@ def flags_cultivo(r: pd.DataFrame) -> pd.DataFrame:
 # Diccionario de flags (explicación para el equipo)
 # ----------------------------------------------------------------------------
 FLAG_DESC = {
-    # Comunes a ambos módulos
     "G01 Duración <15 min": "El tiempo entre que se abrió y se envió el formulario fue menor a 15 minutos. Una encuesta completa difícilmente se levanta tan rápido, así que puede estar incompleta o haberse llenado sin entrevistar realmente. Verificar con el encuestador si fue un reinicio o una prueba.",
     "G02 Fecha de entrevista vacía": "El campo 'Fecha de la entrevista' quedó sin llenar en Kobo. Esa fecha es la que usa el dashboard para medir el avance por día, así que sin ella la encuesta no aparece en la gráfica diaria. Pedir al encuestador que la complete.",
-    "G03 Nombre de prueba": "El nombre del encuestado es un texto de prueba ('NOMBRE', 'PRUEBA', 'TEST', etc.). Casi seguro es un registro de práctica o capacitación que quedó en la base. Confirmar y eliminarlo antes del análisis.",
-    # SCALL
-    "F01 Teléfono inválido": "El número de teléfono tiene letras, símbolos o más de 8 dígitos (el estándar en El Salvador es de 8). Un teléfono mal capturado impide recontactar al productor para verificaciones o para complementar datos por llamada.",
-    "F02 Hogar >10 personas": "El hogar reporta más de 10 miembros, un tamaño poco común. Puede ser real, pero también un error de dedo (ej. 12 en vez de 2). Confirmar el dato con el productor.",
+    "G03 Nombre de prueba": "El registro corresponde a un texto de prueba ('NOMBRE', 'PRUEBA', 'TEST', etc.). Casi seguro es un registro de práctica o capacitación que quedó en la base. Confirmar y eliminarlo antes del análisis.",
+    "G04 ≥3 preguntas clave sin dato": "La encuesta tiene tres o más preguntas clave sin respuesta. Puede deberse a la lógica de salto del formulario, pero también a un problema de comprensión de la pregunta o a una encuesta incompleta. Revisar el registro en Kobo y la sección de valores faltantes del tablero.",
+    "F01 Teléfono inválido": "El número de teléfono tiene letras, símbolos o más de 8 dígitos (el estándar en El Salvador es de 8). Un teléfono mal capturado impide recontactar al hogar para verificaciones o para complementar datos por llamada.",
+    "F02 Hogar >10 personas": "El hogar reporta más de 10 miembros, un tamaño poco común. Puede ser real, pero también un error de dedo (ej. 12 en vez de 2). Confirmar el dato.",
     "F03 Mujeres > total": "El número de mujeres reportado es mayor que el total de personas del hogar, lo cual es imposible. Alguno de los dos números quedó mal capturado y hay que corregirlo.",
     "F04 Hombres+Mujeres ≠ Total": "La suma de hombres más mujeres no coincide con el total de miembros del hogar. Indica error de captura o de conteo en alguno de los tres campos; revisar cuál es el correcto.",
     "F05 Ayudantes > total hogar": "Se reportan más miembros ayudando en las actividades productivas que personas viviendo en el hogar. Es una inconsistencia lógica que requiere verificar ambos números.",
-    "F06 Año SCALL < 2020": "El año de instalación del sistema de captación es anterior a 2020, antes del periodo esperado de entregas del proyecto. Puede tratarse de un sistema previo (no de RECLIMA) o de un año mal recordado o mal digitado.",
+    "F06 Año SCALL < 2020": "El año de instalación del sistema de captación es anterior al periodo esperado de entregas del proyecto. Puede tratarse de un sistema previo (no de RECLIMA) o de un año mal recordado o mal digitado.",
     "F07 Tiempo acarreo sospechoso": "El tiempo de ida y vuelta para acarrear agua antes del proyecto es menor a 10 minutos o mayor a 4 horas. Los extremos suelen ser errores de unidad (horas vs. minutos) o estimaciones poco fiables.",
     "F08 Días agua >30": "Se reportan más de 30 días con agua disponible en el último mes, cuando el máximo posible es 30-31. Es un error de captura o de interpretación de la pregunta.",
     "F09 Litros SCALL >10,000": "El aporte anual de agua reportado supera los 10,000 litros, muy por encima de la capacidad típica de un SCALL domiciliar. Probable error de unidad o estimación exagerada.",
-    "F10 Meses fuera 0-12": "Los meses al año que el SCALL aporta agua están fuera del rango 0 a 12, lo cual es imposible. Corregir el dato con el productor.",
+    "F10 Meses fuera 0-12": "Los meses al año que el SCALL aporta agua están fuera del rango 0 a 12, lo cual es imposible. Corregir el dato.",
     "F11 Tiempo actual sospechoso": "El tiempo actual de ida y vuelta para conseguir agua fuera del hogar es menor a 5 minutos o mayor a 24 horas. Los extremos sugieren error de unidad o de digitación.",
     "F12 Gasto agua atípico": "El gasto mensual en compra o transporte de agua es menor a $1 o mayor a $1,000. Montos así de extremos casi siempre son errores de captura (ej. centavos vs. dólares).",
     "F13 Almacenamiento <100 L": "La capacidad total de almacenamiento reportada es menor a 100 litros, muy por debajo de cualquier tanque SCALL real. Probable error de unidad o dato incompleto.",
     "F14 Gasto mant. atípico": "El gasto anual en mantenimiento es menor a $10 o mayor a $10,000. Fuera de ese rango lo esperable es un error de digitación o una interpretación distinta de la pregunta.",
-    "F15 Días tanque lleno >365": "Los días que duraría un tanque lleno superan los 365, es decir más de un año con una sola llenada, lo cual no es plausible. Revisar si el productor entendió la pregunta.",
+    "F15 Días tanque lleno >365": "Los días que duraría un tanque lleno superan los 365, es decir más de un año con una sola llenada, lo cual no es plausible. Revisar si se entendió la pregunta.",
     "F16 Centinela 9999/999 sin depurar": "El registro contiene códigos 9999 o 999 que significan 'no sabe / no responde' en campos numéricos (tanque, tiempo, almacenamiento, días fuera de servicio). No son valores reales: hay que depurarlos antes de calcular promedios o totales.",
-    # Agrícola
     "F02 Edad atípica": "La edad del productor es menor a 15 o mayor a 100 años. Puede ser un error de dedo o que se registró a la persona equivocada como productor principal.",
     "F03 Hogar >15 personas": "El hogar reporta más de 15 miembros, un tamaño excepcional. Puede ser real, pero conviene confirmar que no sea un error de captura.",
     "F04 Gasto semilla >$5,000": "El gasto en semilla supera los $5,000 en la temporada, muy alto para un pequeño productor. Verificar si es real (productor grande) o un error de monto.",
     "F05 Gasto fertilizantes >$5,000": "El gasto en fertilizantes supera los $5,000 en la temporada. Igual que con semilla: puede ser real en casos excepcionales, pero lo usual es un error de captura.",
-    "F06 Gasto agroquímicos >$5,000": "El gasto en agroquímicos (sin contar fertilizantes) supera los $5,000. Es un monto atípico para la escala de los beneficiarios; confirmar con el productor.",
+    "F06 Gasto agroquímicos >$5,000": "El gasto en agroquímicos (sin contar fertilizantes) supera los $5,000. Es un monto atípico para la escala de los beneficiarios; confirmar.",
     "F07 Gasto mano obra >$10,000": "El gasto en jornales o mano de obra contratada supera los $10,000 en la temporada. Verificar unidad y monto con el encuestador.",
     "F08 Ingreso ventas >$50,000": "El ingreso por venta de cultivos supera los $50,000, fuera de la escala esperada de los beneficiarios. Puede ser un error de digitación (un cero de más).",
     "F09 Ingresos >> gastos x10": "El ingreso por ventas es más de 10 veces la suma de todos los gastos productivos. Una rentabilidad así de alta es improbable y sugiere que algún monto (ingreso o gastos) está mal capturado.",
     "F10 Más parcelas que cultivos": "Se reportan más parcelas que cultivos en total, lo que implicaría parcelas enteras sin ningún cultivo. Es posible, pero conviene confirmar que no se invirtieron los dos números.",
-    "F11 Centinela 9999 en gastos/ingreso": "Algún campo de gastos o de ingreso tiene el código 9999 que significa 'no sabe'. No es un monto real: hay que depurarlo antes de sumar o promediar y, de ser posible, recuperar el dato con el productor.",
-    # Parcelas
+    "F11 Centinela 9999 en gastos/ingreso": "Algún campo de gastos o de ingreso tiene el código 9999 que significa 'no sabe'. No es un monto real: hay que depurarlo antes de sumar o promediar y, de ser posible, recuperar el dato.",
     "P01 Área parcela = 0": "La parcela tiene área cero o negativa, lo cual no es posible si se cultivó en ella. Falta el dato real de superficie; recuperarlo con el encuestador.",
     "P02 Área parcela >500 mz": "La parcela supera las 500 manzanas, una extensión enorme para el perfil de los beneficiarios. Casi seguro es un error de unidad o de digitación.",
     "P03 Árboles plantados > existentes": "Se reportan más árboles plantados en los últimos 12 meses que árboles existentes en total en la parcela. Como los plantados deberían estar incluidos en los existentes, hay una inconsistencia que revisar.",
-    "P04 Qty fertilizante = 9999": "La cantidad de fertilizante tiene el código 9999 de 'no sabe'. Depurar antes de usar el dato y, si se puede, recuperarlo con el productor.",
-    "P05 Qty agroquímico = 9999": "La cantidad de agroquímico tiene el código 9999 de 'no sabe'. Depurar antes de usar el dato y, si se puede, recuperarlo con el productor.",
-    # Cultivos
+    "P04 Qty fertilizante = 9999": "La cantidad de fertilizante tiene el código 9999 de 'no sabe'. Depurar antes de usar el dato y, si se puede, recuperarlo.",
+    "P05 Qty agroquímico = 9999": "La cantidad de agroquímico tiene el código 9999 de 'no sabe'. Depurar antes de usar el dato y, si se puede, recuperarlo.",
     "C01 Cosechada > Sembrada": "El área cosechada es mayor que el área sembrada (medidas en la misma unidad), lo cual no es posible. Uno de los dos valores está mal capturado.",
     "C02 Producción=0, área>0": "Se sembró un área mayor a cero pero la producción reportada es cero. Puede ser una pérdida total real (sequía, plaga) o un dato faltante; conviene confirmar cuál de las dos.",
     "C03 Qty semilla = 9999": "La cantidad de semilla tiene el código 9999 de 'no sabe'. No es un valor real; depurar y de ser posible recuperar el dato.",
@@ -331,7 +391,6 @@ def kpis_y_desgloses(d: pd.DataFrame, flags: pd.DataFrame, notas: pd.DataFrame):
     distr_c = resolve(d, "Distrito", exact=True) or resolve(d, "Distrito")
     fechas = pd.to_datetime(d[fecha_c], errors="coerce") if fecha_c else pd.Series(dtype="datetime64[ns]")
 
-    # KPIs
     dur = duracion_min(d)
     n_flag = flags.any(axis=1).sum()
     c1, c2, c3, c4, c5, c6 = st.columns(6)
@@ -342,7 +401,6 @@ def kpis_y_desgloses(d: pd.DataFrame, flags: pd.DataFrame, notas: pd.DataFrame):
     c5.metric("Con ≥1 flag", f"{n_flag} ({n_flag/len(d):.0%})" if len(d) else "0")
     c6.metric("Duración mediana", f"{dur.median():.0f} min" if dur.notna().any() else "—")
 
-    # Resumen de flags
     st.subheader("🔍 Resumen de flags de calidad")
     resumen = flags.sum().sort_values(ascending=False)
     resumen = resumen[resumen > 0]
@@ -356,14 +414,12 @@ def kpis_y_desgloses(d: pd.DataFrame, flags: pd.DataFrame, notas: pd.DataFrame):
         fig.update_layout(showlegend=False, margin=dict(l=0, r=0, t=10, b=0))
         g.plotly_chart(fig, width="stretch")
 
-    # Distinciones de levantamiento (informativo, no errores)
     if not notas.empty and notas.any().any():
         partes = [f"{int(notas[c].sum())} {c.lower()}" for c in notas.columns if notas[c].sum() > 0]
         st.info("📱 **Distinciones del levantamiento** (no son errores — encuestas "
                 "que quedan en borrador y se complementan por teléfono): "
                 + " · ".join(partes) + ".")
 
-    # Desgloses
     st.subheader("📈 Avance de campo")
     a, b = st.columns(2)
     if distr_c:
@@ -387,7 +443,6 @@ def kpis_y_desgloses(d: pd.DataFrame, flags: pd.DataFrame, notas: pd.DataFrame):
 
 
 def _pct(serie: pd.Series, condicion) -> str:
-    """% de casos que cumplen la condición, sobre los que respondieron."""
     v = serie.dropna().astype(str).str.strip()
     v = v[v != ""]
     if v.empty:
@@ -437,14 +492,43 @@ def seccion_preliminares(d: pd.DataFrame, modulo: str):
             c4.metric("Principal fuente de ingresos (moda)", "—")
 
 
+def seccion_faltantes(d: pd.DataFrame, claves, modulo: str):
+    st.subheader("🕳 Valores faltantes en preguntas clave")
+    st.caption("Encuestas sin dato en preguntas clave, por pregunta y por encuestador. "
+               "Nota: parte de los vacíos puede deberse a la lógica de salto del "
+               "formulario, no a errores — el valor de esta tabla está en detectar "
+               "patrones (una pregunta o un encuestador con faltantes sistemáticos).")
+    filas = []
+    for etiqueta, key in claves:
+        c = resolve(d, key)
+        if c is None:
+            filas.append((etiqueta, "—", "columna no encontrada"))
+            continue
+        v = vacios(d[c])
+        filas.append((etiqueta, int(v.sum()), f"{v.mean():.0%}"))
+    t1 = pd.DataFrame(filas, columns=["Pregunta clave", "Sin dato", "% del total"])
+    a, b = st.columns(2)
+    a.markdown("**Por pregunta**")
+    a.dataframe(t1, hide_index=True, width="stretch")
+    enum_c = resolve(d, K_ENUM)
+    if enum_c:
+        n_falt = faltantes_por_fila(d, claves)
+        t2 = pd.DataFrame({
+            "Encuestas": d.groupby(d[enum_c]).size(),
+            "Prom. preguntas clave sin dato": n_falt.groupby(d[enum_c]).mean().round(1),
+            "Encuestas con ≥3 sin dato": (n_falt >= 3).groupby(d[enum_c]).sum().astype(int),
+        }).sort_values("Prom. preguntas clave sin dato", ascending=False)
+        b.markdown("**Por encuestador**")
+        b.dataframe(t2, width="stretch")
+
+
 def tabla_flags(d: pd.DataFrame, flags: pd.DataFrame):
     st.subheader("⚠ Registros con flags")
-    idx_c = resolve(d, "_index", exact=True)
+    st.caption("Sin datos personales: use el ID para ubicar el registro en Kobo.")
     base = pd.DataFrame({
-        "#": d[idx_c] if idx_c else d.index + 1,
+        "ID": id_encuesta(d),
         "Encuestador": col(d, K_ENUM),
         "Fecha": pd.to_datetime(col(d, "Fecha de la entrevista"), errors="coerce").dt.strftime("%d/%m/%Y"),
-        "Productor": col(d, K_NOMBRE),
         "Distrito": col(d, "Distrito"),
     })
     activos = flags[flags.any(axis=1)]
@@ -463,41 +547,37 @@ def tabla_flags(d: pd.DataFrame, flags: pd.DataFrame):
 
 def ficha_encuestado(d: pd.DataFrame, flags: pd.DataFrame, book: dict = None,
                      modulo: str = ""):
-    st.subheader("👤 Ficha del encuestado")
-    nom_c = resolve(d, K_NOMBRE)
-    idx_c = resolve(d, "_index", exact=True)
-    if nom_c is None:
-        st.info("No se encontró la columna de nombre.")
-        return
-    ids = d[idx_c].astype(str) if idx_c else (d.index + 1).astype(str)
-    etiquetas = ids + " — " + d[nom_c].astype(str)
-    elegido = st.selectbox("Seleccione encuestado (escriba para buscar)",
-                           etiquetas, key=f"ficha_{modulo}")
-    i = etiquetas[etiquetas == elegido].index[0]
-    fila = d.loc[i]
+    st.subheader("👤 Ficha de la encuesta")
+    st.caption("Identificada solo por ID (sin datos personales). Los campos de "
+               "nombres, teléfonos, direcciones y coordenadas están excluidos "
+               "del tablero; consúltelos directamente en Kobo si es necesario.")
+    ids = id_encuesta(d)
+    elegido = st.selectbox("Seleccione la encuesta por ID",
+                           "ID " + ids, key=f"ficha_{modulo}")
+    i = ids.index[("ID " + ids) == elegido][0]
+    fila = quitar_sensibles(d.to_frame().T if isinstance(d, pd.Series) else d).loc[i]
 
-    # Flags de este registro
     activos = [f for f in flags.columns if flags.at[i, f]]
     if activos:
         st.warning("⚠ Flags de este registro: " + ", ".join(activos))
     else:
         st.success("✔ Sin flags de calidad en este registro.")
 
-    # Todas las respuestas (Pregunta / Respuesta)
     ficha = fila.dropna()
     ficha = ficha[ficha.astype(str).str.strip() != ""]
     ficha.index.name = "Pregunta"
     st.dataframe(ficha.rename("Respuesta").to_frame().astype(str),
                  width="stretch", height=450)
 
-    # Parcelas y cultivos del encuestado (Agrícola)
+    # Parcelas y cultivos de la encuesta (Agrícola)
+    idx_c = resolve(d, "_index", exact=True)
     if book is not None and idx_c is not None:
         rp = pick_sheet(book, "roster_parcela")
         if rp is not None and resolve(rp, "_parent_index", exact=True):
-            mias = rp[rp["_parent_index"] == fila[idx_c]]
+            mias = rp[rp["_parent_index"] == d.at[i, idx_c]]
             if len(mias):
-                st.markdown(f"**🌾 Parcelas de este encuestado ({len(mias)})**")
-                st.dataframe(mias.dropna(axis=1, how="all").astype(str),
+                st.markdown(f"**🌾 Parcelas de esta encuesta ({len(mias)})**")
+                st.dataframe(quitar_sensibles(mias).dropna(axis=1, how="all").astype(str),
                              width="stretch", hide_index=True)
                 idxs = set(mias["_index"]) if "_index" in mias.columns else set()
                 for sh, tit in [("roster_cultivos", "🌽 Cultivos — parcela principal"),
@@ -507,7 +587,7 @@ def ficha_encuestado(d: pd.DataFrame, flags: pd.DataFrame, book: dict = None,
                         c = rc[rc["_parent_index"].isin(idxs)]
                         if len(c):
                             st.markdown(f"**{tit} ({len(c)})**")
-                            st.dataframe(c.dropna(axis=1, how="all").astype(str),
+                            st.dataframe(quitar_sensibles(c).dropna(axis=1, how="all").astype(str),
                                          width="stretch", hide_index=True)
 
 
@@ -525,24 +605,21 @@ def seccion_roster(book: dict, d: pd.DataFrame, sheet: str, flag_fn, titulo: str
         st.success("Ningún flag activo.")
         return
     st.dataframe(resumen.rename("Casos ⚠").to_frame(), width=380)
-    # detalle con nombre del productor vía _parent_index
     mask = fl.any(axis=1)
     det = pd.DataFrame(index=r.index)
     for etiqueta, key in cols_id:
         es_exacta = isinstance(key, str) and (key.startswith("_") or key in ("CL", "CLs", "M1_Q6b"))
         det[etiqueta] = col(r, key, exact=es_exacta)
     parent_c = resolve(r, "_parent_index", exact=True)
-    idx_c = resolve(d, "_index", exact=True)
-    nom_c = resolve(d, K_NOMBRE)
-    if parent_c and idx_c and nom_c:
+    if parent_c:
         parents = r[parent_c]
         if via_sheet:  # el roster cuelga de otro roster (ej. cultivo → parcela)
             v = pick_sheet(book, via_sheet)
             if v is not None and "_index" in v.columns and "_parent_index" in v.columns:
                 parents = parents.map(v.set_index(v["_index"])["_parent_index"])
-        mapa = d.set_index(d[idx_c])[nom_c]
-        det["Productor"] = parents.map(mapa)
-    show = pd.concat([det[mask], fl[mask].replace({True: "⚠", False: ""})], axis=1)
+        det["ID Encuesta"] = parents  # rastrear en Kobo por _index
+    show = pd.concat([quitar_sensibles(det[mask]),
+                      fl[mask].replace({True: "⚠", False: ""})], axis=1)
     st.dataframe(show, width="stretch", hide_index=True)
 
 
@@ -553,6 +630,7 @@ def render_modulo(book: dict, esperado: str, nombre: str):
                  "Súbelo en la otra pestaña.")
         return
     flags = flags_scall(d) if esperado == "SCALL" else flags_agricola(d)
+    claves = CLAVES_SCALL if esperado == "SCALL" else CLAVES_AGRI
     notas = distinciones(d)
     kpis_y_desgloses(d, flags, notas)
     seccion_preliminares(d, esperado)
@@ -562,6 +640,7 @@ def render_modulo(book: dict, esperado: str, nombre: str):
                           if n[:1] in ("P", "C") and n[1:3].isdigit()]
     diccionario_flags(nombres_flags)
     tabla_flags(d, flags)
+    seccion_faltantes(d, claves, esperado)
     if esperado == "AGRICOLA":
         st.divider()
         seccion_roster(book, d, "roster_parcela", flags_parcela,
@@ -582,7 +661,7 @@ def render_modulo(book: dict, esperado: str, nombre: str):
 
 
 # ----------------------------------------------------------------------------
-# Reporte acumulado para supervisores (.docx)
+# Reporte acumulado para supervisores (.docx) — sin datos personales
 # ----------------------------------------------------------------------------
 def _doc_tabla(doc, filas, headers):
     from docx.shared import Pt
@@ -608,7 +687,7 @@ def reporte_acumulado_docx(d: pd.DataFrame, flags: pd.DataFrame,
 
     enum_c = resolve(d, K_ENUM)
     distr_c = resolve(d, "Distrito", exact=True) or resolve(d, "Distrito")
-    nom_c = resolve(d, K_NOMBRE)
+    ids = id_encuesta(d)
     fechas = pd.to_datetime(col(d, "Fecha de la entrevista"), errors="coerce").dt.date
     con_flag = flags.any(axis=1)
 
@@ -623,10 +702,11 @@ def reporte_acumulado_docx(d: pd.DataFrame, flags: pd.DataFrame,
         rango = f"Periodo: {fv.min():%d/%m/%Y} – {fv.max():%d/%m/%Y}   ·   "
     doc.add_paragraph(
         rango + f"Generado: {datetime.now():%d/%m/%Y %H:%M}   ·   "
-        "Proyecto RECLIMA — Evaluación final, corredor seco de El Salvador"
+        "Proyecto RECLIMA — Evaluación final, corredor seco de El Salvador. "
+        "Este reporte no contiene datos personales: los registros se identifican "
+        "por su ID de Kobo (_index)."
     )
 
-    # 1. Avance
     doc.add_heading("1. Avance de campo (acumulado)", 1)
     doc.add_paragraph(
         f"Se han levantado {len(d)} encuestas con "
@@ -645,7 +725,6 @@ def reporte_acumulado_docx(d: pd.DataFrame, flags: pd.DataFrame,
         doc.add_paragraph("Encuestas por distrito:", style="Intense Quote")
         _doc_tabla(doc, list(g.items()), ["Distrito", "Encuestas"])
 
-    # 2. Flags a atender
     doc.add_heading("2. Flags a atender", 1)
     resumen = flags.sum().sort_values(ascending=False)
     resumen = resumen[resumen > 0]
@@ -653,27 +732,25 @@ def reporte_acumulado_docx(d: pd.DataFrame, flags: pd.DataFrame,
         doc.add_paragraph("No hay flags de calidad activos. ✔")
     else:
         doc.add_paragraph(
-            "Casos por flag, con los productores afectados y su encuestador "
-            "(para ubicar y verificar cada registro):")
+            "Casos por flag, con el ID de Kobo de cada registro afectado y su "
+            "encuestador (para ubicar y verificar en Kobo):")
         filas = []
         for flag_name, n in resumen.items():
             afectados = []
             for i in d.index[flags[flag_name]]:
-                p = d.at[i, nom_c] if nom_c else f"fila {i}"
                 e = d.at[i, enum_c] if enum_c else ""
-                afectados.append(f"{p} ({e})" if e else str(p))
-            filas.append((flag_name, int(n), "; ".join(map(str, afectados))))
-        _doc_tabla(doc, filas, ["Flag", "Casos", "Productores afectados (encuestador)"])
+                afectados.append(f"#{ids.loc[i]} ({e})" if e else f"#{ids.loc[i]}")
+            filas.append((flag_name, int(n), "; ".join(afectados)))
+        _doc_tabla(doc, filas, ["Flag", "Casos", "IDs afectados (encuestador)"])
         doc.add_paragraph("Descripción de los flags activos:", style="Intense Quote")
         for flag_name in resumen.index:
             if flag_name in FLAG_DESC:
-                p = doc.add_paragraph()
-                p.add_run(flag_name + ": ").bold = True
-                p.add_run(FLAG_DESC[flag_name])
+                pr = doc.add_paragraph()
+                pr.add_run(flag_name + ": ").bold = True
+                pr.add_run(FLAG_DESC[flag_name])
     if extra:
         doc.add_paragraph(extra)
 
-    # 3. Distinciones del levantamiento (informativo)
     if not notas.empty and notas.any().any():
         doc.add_heading("3. Distinciones del levantamiento (informativo)", 1)
         doc.add_paragraph(
@@ -685,7 +762,6 @@ def reporte_acumulado_docx(d: pd.DataFrame, flags: pd.DataFrame,
                          for c in notas.columns if notas[c].sum() > 0],
                    ["Distinción", "Encuestas", "Proporción"])
 
-    # 4. Ranking de encuestadores
     doc.add_heading("4. Ranking de encuestadores", 1)
     if enum_c:
         rk = pd.DataFrame({
@@ -731,7 +807,6 @@ ARCHIVO_PUBLICADO = {"SCALL": "scall.xlsx", "AGRICOLA": "agricola.xlsx"}
 
 @st.cache_data(show_spinner=False)
 def libro_publicado(nombre_archivo: str, mtime: float):
-    """Carga la base publicada en el repo. `mtime` invalida el caché al actualizar."""
     with open(os.path.join(DATA_DIR, nombre_archivo), "rb") as fh:
         return load_book(fh.read())
 
@@ -759,8 +834,9 @@ def pestana_modulo(esperado: str, nombre: str, key: str):
 # ----------------------------------------------------------------------------
 if check_password():
     st.title("🌱 Dashboard de monitoreo RECLIMA")
-    st.caption("Evaluación final — corredor seco de El Salvador. "
-               "Los datos los publica el administrador; se actualizan automáticamente.")
+    st.caption("Evaluación final — corredor seco de El Salvador. Los datos los "
+               "publica el administrador y se actualizan automáticamente. "
+               "El tablero no muestra datos personales de los entrevistados.")
 
     tab_scall, tab_agri = st.tabs(["💧 SCALL", "🌾 Agrícola"])
 
