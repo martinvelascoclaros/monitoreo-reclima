@@ -123,7 +123,7 @@ def id_encuesta(d: pd.DataFrame) -> pd.Series:
 # ----------------------------------------------------------------------------
 PATRON_SENSIBLE = re.compile(
     r"nombre|telefono|celular|correo|contacto|domicilio|direccion|geoloc"
-    r"|latitud|longitud|latitude|longitude|altitude|precision|gps|poligono|polygon|shape",
+    r"|latitud|longitud|latitude|longitude|altitude|precision|gps|poligono|polygon|shape|coordenadas",
     re.I)
 
 
@@ -598,6 +598,130 @@ def seccion_mapa(d: pd.DataFrame):
         st.caption(f"{sin_gps} encuesta(s) sin coordenadas no aparecen en el mapa.")
 
 
+# ----------------------------------------------------------------------------
+# Polígonos de parcela (geoshape de Kobo): visualización y control de calidad
+# ----------------------------------------------------------------------------
+M2_POR_MANZANA = 6989.0
+M2_POR_TAREA = 437.0
+
+
+def parse_geoshape(s):
+    """'lat lon alt prec;lat lon alt prec;...' -> lista de (lat, lon, prec)."""
+    pts = []
+    for seg in str(s).split(";"):
+        p = seg.strip().split()
+        if len(p) >= 2:
+            try:
+                prec = float(p[3]) if len(p) > 3 else np.nan
+                pts.append((float(p[0]), float(p[1]), prec))
+            except ValueError:
+                pass
+    return pts
+
+
+def area_m2(pts) -> float:
+    """Área del polígono (m²) por fórmula del polígono en proyección local."""
+    import math
+    if len(pts) < 3:
+        return 0.0
+    lat0 = sum(p[0] for p in pts) / len(pts)
+    xs = [p[1] * 111320 * math.cos(math.radians(lat0)) for p in pts]
+    ys = [p[0] * 110540 for p in pts]
+    a = 0.0
+    for i in range(len(xs)):
+        j = (i + 1) % len(xs)
+        a += xs[i] * ys[j] - xs[j] * ys[i]
+    return abs(a) / 2
+
+
+def seccion_poligonos(d: pd.DataFrame, book: dict):
+    geo_c = resolve(d, "coordenadas de la esquina de la parcela")
+    if geo_c is None:
+        return
+    ids = id_encuesta(d)
+    idx_c = resolve(d, "_index", exact=True)
+    rp = pick_sheet(book, "roster_parcela")
+
+    regs, shapes = [], []
+    for i in d.index:
+        v = d.at[i, geo_c]
+        if pd.isna(v) or ";" not in str(v):
+            continue
+        pts = parse_geoshape(v)
+        if not pts:
+            continue
+        a_m2 = area_m2(pts)
+        precs = [p[2] for p in pts if not pd.isna(p[2])]
+        prec_media = float(np.mean(precs)) if precs else np.nan
+        # vértices consecutivos idénticos (encuestador sin moverse)
+        dup = sum(1 for k in range(1, len(pts))
+                  if (pts[k][0], pts[k][1]) == (pts[k-1][0], pts[k-1][1]))
+        # área reportada de la primera parcela del productor (referencia)
+        rep_txt, ratio = "—", np.nan
+        if rp is not None and idx_c is not None and "_parent_index" in rp.columns:
+            mias = rp[rp["_parent_index"] == d.at[i, idx_c]]
+            if len(mias):
+                ar = num(mias[resolve(mias, "el area de")]).iloc[0] if resolve(mias, "el area de") else np.nan
+                un = str(mias[resolve(mias, "M1_Q6b", exact=True)].iloc[0]) if resolve(mias, "M1_Q6b", exact=True) else ""
+                if not pd.isna(ar):
+                    rep_txt = f"{ar:g} {un}"
+                    factor = {"Manzanas": M2_POR_MANZANA, "Tareas": M2_POR_TAREA}.get(un)
+                    if factor and ar > 0:
+                        ratio = a_m2 / (ar * factor)
+        alertas = []
+        if len(pts) < 3:
+            alertas.append("menos de 3 vértices")
+        if a_m2 < 50:
+            alertas.append("área ≈ 0")
+        if not pd.isna(prec_media) and prec_media > 15:
+            alertas.append(f"precisión GPS mala ({prec_media:.0f} m)")
+        if dup > 0:
+            alertas.append(f"{dup} vértice(s) duplicado(s)")
+        if not pd.isna(ratio) and (ratio > 3 or ratio < 1/3):
+            alertas.append(f"difiere del área reportada (x{ratio:.1f})")
+        regs.append({
+            "ID": ids.loc[i],
+            "Vértices": len(pts),
+            "Área medida (mz)": round(a_m2 / M2_POR_MANZANA, 2),
+            "Área medida (m²)": round(a_m2),
+            "Área reportada (1ª parcela)": rep_txt,
+            "Precisión GPS media (m)": round(prec_media, 1) if not pd.isna(prec_media) else "—",
+            "⚠ Revisar": "; ".join(alertas) if alertas else "✔",
+        })
+        shapes.append((ids.loc[i], pts))
+    if not regs:
+        return
+
+    st.subheader("📐 Polígonos de parcela principal (control de calidad)")
+    st.caption("Polígonos registrados con geoshape, identificados solo por ID. "
+               "El área medida se calcula a partir de los vértices GPS; compárela "
+               "con el área reportada por el productor. Uso interno del equipo.")
+    st.dataframe(pd.DataFrame(regs), hide_index=True, width="stretch")
+
+    import plotly.graph_objects as go
+    usa_map = hasattr(go, "Scattermap")
+    fig = go.Figure()
+    for pid, pts in shapes:
+        lats = [p[0] for p in pts] + [pts[0][0]]
+        lons = [p[1] for p in pts] + [pts[0][1]]
+        tr = dict(lat=lats, lon=lons, mode="lines+markers", fill="toself",
+                  name=f"#{pid}", hovertext=f"ID #{pid}")
+        fig.add_trace(go.Scattermap(**tr) if usa_map else go.Scattermapbox(**tr))
+    todas_lat = [p[0] for _, pts in shapes for p in pts]
+    todas_lon = [p[1] for _, pts in shapes for p in pts]
+    centro = dict(lat=float(np.mean(todas_lat)), lon=float(np.mean(todas_lon)))
+    if usa_map:
+        fig.update_layout(map=dict(style="open-street-map", center=centro, zoom=13),
+                          height=500, margin=dict(l=0, r=0, t=10, b=0))
+    else:
+        fig.update_layout(mapbox=dict(style="open-street-map", center=centro, zoom=13),
+                          height=500, margin=dict(l=0, r=0, t=10, b=0))
+    st.plotly_chart(fig, width="stretch")
+    st.caption("Consejo: acerque el zoom sobre cada polígono para verificar su "
+               "forma. Un polígono válido debe cerrar sobre sí mismo y tener un "
+               "área coherente con lo reportado.")
+
+
 def tabla_flags(d: pd.DataFrame, flags: pd.DataFrame):
     st.subheader("⚠ Registros con flags")
     st.caption("Sin datos personales: use el ID para ubicar el registro en Kobo.")
@@ -732,6 +856,7 @@ def render_modulo(book: dict, esperado: str, nombre: str):
                        "🌽 Flags de cultivos — otras parcelas",
                        [("Cultivo", "CL"), ("Área sembrada", "area total sembrada")],
                        via_sheet="roster_parcela")
+        seccion_poligonos(d, book)
     seccion_reporte(d, flags, notas, "SCALL" if esperado == "SCALL" else "Agrícola")
     st.divider()
     ficha_encuestado(d, flags, book if esperado == "AGRICOLA" else None, esperado)
