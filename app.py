@@ -747,6 +747,8 @@ def seccion_poligonos(d: pd.DataFrame, book: dict):
     st.markdown("**🔎 Ver el polígono de una observación**")
     opciones = [pid for pid, _ in shapes]
     sel = st.selectbox("Seleccione la encuesta (ID)", opciones, key="poly_sel")
+    if sel not in dict(shapes):  # selección de una base anterior
+        sel = opciones[0]
     pts_sel = dict(shapes)[sel]
     fila_sel = next(r for r in regs if r["ID"] == sel)
     st.dataframe(pd.DataFrame([fila_sel]), hide_index=True, width="stretch")
@@ -806,7 +808,9 @@ def ficha_encuestado(d: pd.DataFrame, flags: pd.DataFrame, book: dict = None,
     etiquetas = ids.where(ids.str.startswith("s/ID"), ids + " · k" + kobo)
     elegido = st.selectbox("Seleccione la encuesta por ID (PRODUCTOS-ID ENCUESTA)",
                            etiquetas, key=f"ficha_{modulo}")
-    i = etiquetas.index[etiquetas == elegido][0]
+    mask = etiquetas == elegido
+    # si cambió la base, la selección guardada puede no existir: usar la primera
+    i = etiquetas.index[mask][0] if mask.any() else etiquetas.index[0]
     fila = quitar_sensibles(d).loc[i]
 
     activos = [f for f in flags.columns if flags.at[i, f]]
