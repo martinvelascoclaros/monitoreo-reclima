@@ -138,20 +138,39 @@ def quitar_sensibles(df: pd.DataFrame) -> pd.DataFrame:
     return df[[c for c in df.columns if not es_sensible(c)]]
 
 
+def vacios(serie: pd.Series) -> pd.Series:
+    return serie.isna() | serie.astype(str).str.strip().isin(["", "nan", "None"])
+
+
 # ----------------------------------------------------------------------------
-# Preguntas clave para el análisis de valores faltantes
+# Preguntas clave (SCALL: lista definida por ADEPRO/FAO, jul 2026)
 # ----------------------------------------------------------------------------
+OBLIGATORIAS_SCALL = [
+    ("Tiene instalado SCALL", "Tiene instalado en su hogar un sistema"),
+    ("Nombre de pila del jefe de hogar", "nombre de pila o nombre propio"),
+    ("Sexo del jefe de hogar (M1)", "sexo de ${M1_Q2}"),
+    ("Años cumplidos (M1)", "años cumplidos tiene ${M1_Q2}"),
+    ("Grado escolar (M1)", "grado o año escolar más alto"),
+    ("Pertenece a Pueblo Indígena", "pertenece o se identifica con un Pueblo Indígena"),
+    ("Personas en el hogar", "personas habitan al día de hoy"),
+    ("Mujeres en el hogar", "cuántas son mujeres"),
+    ("res_miembros", "res_miembros"),
+    ("Hombres en el hogar", ["cuántos son hombres", "cuántas son hombres"]),
+    ("Miembros de 15 años o menos", "15 años o menos"),
+    ("Ayudantes del productor", "ayudantes del productor"),
+    ("Fuente principal de ingresos", "principal fuente de ingresos"),
+]
 CLAVES_SCALL = [
     ("Fecha de la entrevista", "Fecha de la entrevista"),
-    ("Distrito", "Distrito"),
-    ("Miembros del hogar", "personas habitan al dia de hoy"),
-    ("Mujeres en el hogar", "cuantas son mujeres"),
-    ("Año de instalación del SCALL", "año que le instalaron"),
-    ("Uso actual del agua del SCALL", "el hogar usa agua del SCALL"),
-    ("Meses al año que aporta agua", ["cuantos meses aporta agua", "meses al año su scall aporta"]),
-    ("Capacidad de almacenamiento", "capacidad total de almacenamiento"),
-    ("Gasto en mantenimiento", "gasto estimado en mantenimiento"),
-]
+    ("Nombre del encuestador", K_ENUM),
+    ("Cantón", "Cantón"),
+    ("Caserío", "Caserío"),
+    ("Identificador de encuestado", "Identificador de encuestado"),
+    ("Geolocalización del hogar", "Registrar geolocalización del hogar"),
+    ("Relación con el jefe de hogar", "relación con el jefe de hogar"),
+    ("Edad del jefe de hogar", ["edad de la jefa o jefe de hogar", "edad del productor"]),
+] + OBLIGATORIAS_SCALL
+
 CLAVES_AGRI = [
     ("Fecha de la entrevista", "Fecha de la entrevista"),
     ("Distrito", "Distrito"),
@@ -166,10 +185,6 @@ CLAVES_AGRI = [
 ]
 
 
-def vacios(serie: pd.Series) -> pd.Series:
-    return serie.isna() | serie.astype(str).str.strip().isin(["", "nan", "None"])
-
-
 def faltantes_por_fila(d: pd.DataFrame, claves) -> pd.Series:
     cols = [resolve(d, k) for _, k in claves]
     cols = [c for c in cols if c is not None]
@@ -179,7 +194,7 @@ def faltantes_por_fila(d: pd.DataFrame, claves) -> pd.Series:
 
 
 def flags_comunes(d: pd.DataFrame, f: pd.DataFrame, claves=None) -> pd.DataFrame:
-    """Flags aplicables a cualquier módulo."""
+    """Flags aplicables al módulo Agrícola (SCALL usa su propia lista)."""
     f["G01 Duración <15 min"] = duracion_min(d) < 15
     fe = pd.to_datetime(col(d, "Fecha de la entrevista"), errors="coerce")
     f["G02 Fecha de entrevista vacía"] = fe.isna()
@@ -229,41 +244,53 @@ def detect_module(book: dict):
 
 
 # ----------------------------------------------------------------------------
-# Definición de flags
+# Flags SCALL — lista definitiva acordada con FAO (jul 2026)
 # ----------------------------------------------------------------------------
 def flags_scall(d: pd.DataFrame) -> pd.DataFrame:
-    an = num(col(d, "personas habitan al dia de hoy"))
-    ao = num(col(d, "cuantas son mujeres"))
-    ap = num(col(d, "cuantas son hombres"))
     f = pd.DataFrame(index=d.index)
-    f["F01 Teléfono inválido"] = flag_telefono(col(d, "numero de telefono del productor"))
-    f["F02 Hogar >10 personas"] = an > 10
-    f["F03 Mujeres > total"] = ao > an
-    f["F04 Hombres+Mujeres ≠ Total"] = (ao + ap).notna() & an.notna() & ((ao + ap) != an)
-    f["F05 Ayudantes > total hogar"] = num(col(d, "ayudantes del productor")) > an
-    f["F06 Año SCALL < 2020"] = skip(col(d, "año que le instalaron"), 9) < 2020
-    bn = skip(col(d, "tiempo ida y vuelta para acarrear agua"), 9999)
-    f["F07 Tiempo acarreo sospechoso"] = (bn > 240) | (bn < 10)
-    f["F08 Días agua >30"] = skip(col(d, "cuantos dias hubo agua disponible"), 99) > 30
-    f["F09 Litros SCALL >10,000"] = skip(col(d, "cuantos litros de agua aporta"), 9999) > 10000
-    bv = skip(col(d, ["cuantos meses aporta agua", "meses al año su scall aporta"]), 99)
-    f["F10 Meses fuera 0-12"] = (bv < 0) | (bv > 12)
-    ce = skip(col(d, ["tiempo actual ida y vuelta", "tiempo actual de ida y vuelta"]), 9999)
-    f["F11 Tiempo actual sospechoso"] = (ce < 5) | (ce > 1440)
-    cf = num(col(d, "gasto mensual actual en compra"))
-    f["F12 Gasto agua atípico"] = (cf > 0) & ((cf < 1) | (cf > 1000))
-    cg = skip(col(d, "capacidad total de almacenamiento"), 9999, 999)
-    f["F13 Almacenamiento <100 L"] = (cg > 0) & (cg < 100)
-    ct = num(col(d, "gasto estimado en mantenimiento"))
-    f["F14 Gasto mant. atípico"] = (ct > 0) & ((ct < 10) | (ct > 10000))
-    f["F15 Días tanque lleno >365"] = skip(col(d, "dias le duraria un tanque lleno"), 9999) > 365
-    f["F16 Centinela 9999/999 sin depurar"] = (
-        (num(col(d, "dias le duraria un tanque lleno")) == 9999)
-        | (num(col(d, ["tiempo actual ida y vuelta", "tiempo actual de ida y vuelta"])) == 9999)
-        | (num(col(d, "capacidad total de almacenamiento")).isin([9999, 999]))
-        | (num(col(d, "dias estuvo fuera de servicio")) == 999)
-    )
-    return flags_comunes(d, f, CLAVES_SCALL).fillna(False)
+    f["S01 Sin nombre de encuestador"] = vacios(col(d, K_ENUM))
+    edad = num(col(d, ["edad de la jefa o jefe de hogar", "edad del productor"]))
+    f["S02 Edad <18, >90 o faltante"] = edad.isna() | (edad < 18) | (edad > 90)
+    f["S03 Cantón o caserío vacío"] = (vacios(col(d, "Cantón", exact=True))
+                                       | vacios(col(d, "Caserío", exact=True)))
+    f["S04 Sin identificador del encuestado"] = vacios(col(d, "Identificador de encuestado"))
+    f["S05 Sin geolocalización del hogar"] = vacios(col(d, "Registrar geolocalización del hogar"))
+    f["S06 Sin relación con el jefe de hogar"] = vacios(col(d, "relación con el jefe de hogar"))
+
+    # S07: preguntas obligatorias del módulo de hogar sin respuesta.
+    # Las de Pueblo Indígena son condicionales: solo cuentan si aplica la rama.
+    faltas = faltantes_por_fila(d, OBLIGATORIAS_SCALL)
+    pert = col(d, "pertenece o se identifica con un Pueblo Indígena").astype(str)
+    cond_pueblo = vacios(col(d, "A qué Pueblo Indígena")) & pert.str.startswith("Sí")
+    pueblo = col(d, "A qué Pueblo Indígena").astype(str)
+    cond_esp = vacios(col(d, "Especificar Pueblo Indígena")) & pueblo.str.contains("Otro", na=False)
+    f["S07 Obligatorias del hogar sin respuesta"] = (faltas >= 1) | cond_pueblo | cond_esp
+
+    s_an = col(d, "año que le instalaron")
+    if pd.api.types.is_datetime64_any_dtype(s_an):
+        an = s_an.dt.year.astype(float)  # Kobo exporta el año como fecha
+    else:
+        an = num(s_an)
+    f["S08 Año SCALL ≤2022 o no es un año"] = an.notna() & ((an <= 2022) | (an > 2100))
+    f["S09 Días tanque lleno >365"] = num(col(d, "dias le duraria un tanque lleno")) > 365
+    f["S10 Meses de aporte >12"] = num(col(d, ["meses al año su scall aporta",
+                                               "cuantos meses aporta agua"])) > 12
+
+    # S11: obligatorias que no se desplegaron (posible falla de lógica del
+    # formulario), desglosadas para ver exactamente cuál pregunta faltó
+    recibio = col(d, "Recibió capacitación en instalación").astype(str)
+    f["S11a No desplegada: quién realiza el mantenimiento"] = vacios(
+        col(d, "Quién realiza el mantenimiento habitual"))
+    f["S11b No desplegada: tipo de capacitación"] = (
+        vacios(col(d, "Qué tipo de capacitación recibió"))
+        & recibio.str.startswith("Sí"))
+    f["S11c No desplegada: componentes observados"] = vacios(
+        col(d, "componentes observó a partir de su inspección visual"))
+    f["S11d No desplegada: frecuencia de limpieza"] = vacios(
+        col(d, "frecuencia se da limpieza"))
+    fe = pd.to_datetime(col(d, "Fecha de la entrevista"), errors="coerce")
+    f["S12 Sin fecha de entrevista"] = fe.isna()
+    return f.fillna(False)
 
 
 def flags_agricola(d: pd.DataFrame) -> pd.DataFrame:
@@ -328,41 +355,46 @@ def flags_cultivo(r: pd.DataFrame) -> pd.DataFrame:
 # Diccionario de flags (explicación para el equipo)
 # ----------------------------------------------------------------------------
 FLAG_DESC = {
-    "G01 Duración <15 min": "El tiempo entre que se abrió y se envió el formulario fue menor a 15 minutos. Una encuesta completa difícilmente se levanta tan rápido, así que puede estar incompleta o haberse llenado sin entrevistar realmente. Verificar con el encuestador si fue un reinicio o una prueba.",
-    "G02 Fecha de entrevista vacía": "El campo 'Fecha de la entrevista' quedó sin llenar en Kobo. Esa fecha es la que usa el dashboard para medir el avance por día, así que sin ella la encuesta no aparece en la gráfica diaria. Pedir al encuestador que la complete.",
-    "G03 Nombre de prueba": "El registro corresponde a un texto de prueba ('NOMBRE', 'PRUEBA', 'TEST', etc.). Casi seguro es un registro de práctica o capacitación que quedó en la base. Confirmar y eliminarlo antes del análisis.",
-    "G04 ≥3 preguntas clave sin dato": "La encuesta tiene tres o más preguntas clave sin respuesta. Puede deberse a la lógica de salto del formulario, pero también a un problema de comprensión de la pregunta o a una encuesta incompleta. Revisar el registro en Kobo y la sección de valores faltantes del tablero.",
-    "F01 Teléfono inválido": "El número de teléfono tiene letras, símbolos o más de 8 dígitos (el estándar en El Salvador es de 8). Un teléfono mal capturado impide recontactar al hogar para verificaciones o para complementar datos por llamada.",
-    "F02 Hogar >10 personas": "El hogar reporta más de 10 miembros, un tamaño poco común. Puede ser real, pero también un error de dedo (ej. 12 en vez de 2). Confirmar el dato.",
-    "F03 Mujeres > total": "El número de mujeres reportado es mayor que el total de personas del hogar, lo cual es imposible. Alguno de los dos números quedó mal capturado y hay que corregirlo.",
-    "F04 Hombres+Mujeres ≠ Total": "La suma de hombres más mujeres no coincide con el total de miembros del hogar. Indica error de captura o de conteo en alguno de los tres campos; revisar cuál es el correcto.",
-    "F05 Ayudantes > total hogar": "Se reportan más miembros ayudando en las actividades productivas que personas viviendo en el hogar. Es una inconsistencia lógica que requiere verificar ambos números.",
-    "F06 Año SCALL < 2020": "El año de instalación del sistema de captación es anterior al periodo esperado de entregas del proyecto. Puede tratarse de un sistema previo (no de RECLIMA) o de un año mal recordado o mal digitado.",
-    "F07 Tiempo acarreo sospechoso": "El tiempo de ida y vuelta para acarrear agua antes del proyecto es menor a 10 minutos o mayor a 4 horas. Los extremos suelen ser errores de unidad (horas vs. minutos) o estimaciones poco fiables.",
-    "F08 Días agua >30": "Se reportan más de 30 días con agua disponible en el último mes, cuando el máximo posible es 30-31. Es un error de captura o de interpretación de la pregunta.",
-    "F09 Litros SCALL >10,000": "El aporte anual de agua reportado supera los 10,000 litros, muy por encima de la capacidad típica de un SCALL domiciliar. Probable error de unidad o estimación exagerada.",
-    "F10 Meses fuera 0-12": "Los meses al año que el SCALL aporta agua están fuera del rango 0 a 12, lo cual es imposible. Corregir el dato.",
-    "F11 Tiempo actual sospechoso": "El tiempo actual de ida y vuelta para conseguir agua fuera del hogar es menor a 5 minutos o mayor a 24 horas. Los extremos sugieren error de unidad o de digitación.",
-    "F12 Gasto agua atípico": "El gasto mensual en compra o transporte de agua es menor a $1 o mayor a $1,000. Montos así de extremos casi siempre son errores de captura (ej. centavos vs. dólares).",
-    "F13 Almacenamiento <100 L": "La capacidad total de almacenamiento reportada es menor a 100 litros, muy por debajo de cualquier tanque SCALL real. Probable error de unidad o dato incompleto.",
-    "F14 Gasto mant. atípico": "El gasto anual en mantenimiento es menor a $10 o mayor a $10,000. Fuera de ese rango lo esperable es un error de digitación o una interpretación distinta de la pregunta.",
-    "F15 Días tanque lleno >365": "Los días que duraría un tanque lleno superan los 365, es decir más de un año con una sola llenada, lo cual no es plausible. Revisar si se entendió la pregunta.",
-    "F16 Centinela 9999/999 sin depurar": "El registro contiene códigos 9999 o 999 que significan 'no sabe / no responde' en campos numéricos (tanque, tiempo, almacenamiento, días fuera de servicio). No son valores reales: hay que depurarlos antes de calcular promedios o totales.",
+    # SCALL (lista definitiva)
+    "S01 Sin nombre de encuestador": "El registro no tiene el nombre del encuestador. Sin ese dato no se puede atribuir la encuesta ni dar seguimiento a la supervisión. Completarlo en Kobo.",
+    "S02 Edad <18, >90 o faltante": "La edad del jefe o jefa de hogar falta o está fuera del rango 18-90 años. Un menor de edad no debería ser el entrevistado principal, y edades mayores a 90 suelen ser errores de digitación. Verificar el registro.",
+    "S03 Cantón o caserío vacío": "El cantón o el caserío del hogar quedaron sin nombre. Son datos necesarios para ubicar el hogar en campo y para los desgloses territoriales; completarlos en Kobo.",
+    "S04 Sin identificador del encuestado": "Falta el identificador del encuestado que entrega el supervisor. Sin este ID no se puede vincular la encuesta con el listado de beneficiarios. Es prioritario recuperarlo.",
+    "S05 Sin geolocalización del hogar": "No se registró la coordenada GPS del hogar. La geolocalización es obligatoria para la verificación en campo; el encuestador debe capturarla al momento de la visita.",
+    "S06 Sin relación con el jefe de hogar": "No se registró la relación del informante con el jefe o jefa de hogar. El dato es necesario para validar que el informante sea idóneo.",
+    "S07 Obligatorias del hogar sin respuesta": "Una o más preguntas obligatorias del módulo de hogar están sin respuesta (instalación del SCALL, características del jefe de hogar, composición del hogar, fuente de ingresos). Si esto ocurre de forma masiva, el problema es la lógica de salto del formulario, no los encuestadores. Las preguntas de Pueblo Indígena solo cuentan cuando aplica la rama.",
+    "S08 Año SCALL ≤2022 o no es un año": "El año de instalación del SCALL es menor o igual a 2022, o el valor capturado no es un año válido (por ejemplo, un dígito suelto o un código). Verificar con el hogar el año real de entrega del sistema.",
+    "S09 Días tanque lleno >365": "Los días que duraría un tanque lleno superan los 365 — más de un año con una sola llenada no es plausible. Incluye valores centinela (9999) que deben depurarse.",
+    "S10 Meses de aporte >12": "Los meses al año que el SCALL aporta agua superan los 12, lo cual es imposible. Incluye valores centinela (99) que deben depurarse.",
+    "S11a No desplegada: quién realiza el mantenimiento": "La pregunta '¿Quién realiza el mantenimiento habitual?' quedó vacía. Es obligatoria, así que el vacío sugiere que el formulario no la desplegó — revisar la lógica de salto del cuestionario en Kobo.",
+    "S11b No desplegada: tipo de capacitación": "La pregunta '¿Qué tipo de capacitación recibió?' quedó vacía en un hogar que SÍ reportó haber recibido capacitación. La rama debió desplegarse; revisar la lógica del cuestionario.",
+    "S11c No desplegada: componentes observados": "La verificación visual del encuestador ('¿Qué componentes observó a partir de su inspección visual?') quedó vacía. Es un paso obligatorio de la visita; revisar si el formulario la desplegó o si el encuestador la omitió.",
+    "S11d No desplegada: frecuencia de limpieza": "La pregunta '¿Con qué frecuencia se da limpieza a canaletas, tanque o filtros?' quedó vacía. Es obligatoria del bloque de mantenimiento; revisar la lógica del cuestionario.",
+    "S12 Sin fecha de entrevista": "El campo 'Fecha de la entrevista' quedó sin llenar en Kobo. Esa fecha es la que usa el tablero para medir el avance por día; sin ella la encuesta no aparece en la gráfica diaria.",
+    # Comunes (módulo Agrícola)
+    "G01 Duración <15 min": "El tiempo entre que se abrió y se envió el formulario fue menor a 15 minutos. Una encuesta completa difícilmente se levanta tan rápido, así que puede estar incompleta o haberse llenado sin entrevistar realmente.",
+    "G02 Fecha de entrevista vacía": "El campo 'Fecha de la entrevista' quedó sin llenar en Kobo. Esa fecha es la que usa el tablero para medir el avance por día. Pedir al encuestador que la complete.",
+    "G03 Nombre de prueba": "El registro corresponde a un texto de prueba ('NOMBRE', 'PRUEBA', 'TEST', etc.). Casi seguro es un registro de práctica que quedó en la base. Confirmar y eliminarlo antes del análisis.",
+    "G04 ≥3 preguntas clave sin dato": "La encuesta tiene tres o más preguntas clave sin respuesta. Puede deberse a la lógica de salto del formulario, pero también a una encuesta incompleta. Revisar el registro en Kobo y la sección de valores faltantes.",
+    # Agrícola
+    "F01 Teléfono inválido": "El número de teléfono tiene letras, símbolos o más de 8 dígitos (el estándar en El Salvador es de 8). Un teléfono mal capturado impide recontactar al hogar para verificaciones.",
     "F02 Edad atípica": "La edad del productor es menor a 15 o mayor a 100 años. Puede ser un error de dedo o que se registró a la persona equivocada como productor principal.",
     "F03 Hogar >15 personas": "El hogar reporta más de 15 miembros, un tamaño excepcional. Puede ser real, pero conviene confirmar que no sea un error de captura.",
     "F04 Gasto semilla >$5,000": "El gasto en semilla supera los $5,000 en la temporada, muy alto para un pequeño productor. Verificar si es real (productor grande) o un error de monto.",
-    "F05 Gasto fertilizantes >$5,000": "El gasto en fertilizantes supera los $5,000 en la temporada. Igual que con semilla: puede ser real en casos excepcionales, pero lo usual es un error de captura.",
+    "F05 Gasto fertilizantes >$5,000": "El gasto en fertilizantes supera los $5,000 en la temporada. Puede ser real en casos excepcionales, pero lo usual es un error de captura.",
     "F06 Gasto agroquímicos >$5,000": "El gasto en agroquímicos (sin contar fertilizantes) supera los $5,000. Es un monto atípico para la escala de los beneficiarios; confirmar.",
     "F07 Gasto mano obra >$10,000": "El gasto en jornales o mano de obra contratada supera los $10,000 en la temporada. Verificar unidad y monto con el encuestador.",
     "F08 Ingreso ventas >$50,000": "El ingreso por venta de cultivos supera los $50,000, fuera de la escala esperada de los beneficiarios. Puede ser un error de digitación (un cero de más).",
-    "F09 Ingresos >> gastos x10": "El ingreso por ventas es más de 10 veces la suma de todos los gastos productivos. Una rentabilidad así de alta es improbable y sugiere que algún monto (ingreso o gastos) está mal capturado.",
+    "F09 Ingresos >> gastos x10": "El ingreso por ventas es más de 10 veces la suma de todos los gastos productivos. Una rentabilidad así de alta es improbable y sugiere que algún monto está mal capturado.",
     "F10 Más parcelas que cultivos": "Se reportan más parcelas que cultivos en total, lo que implicaría parcelas enteras sin ningún cultivo. Es posible, pero conviene confirmar que no se invirtieron los dos números.",
-    "F11 Centinela 9999 en gastos/ingreso": "Algún campo de gastos o de ingreso tiene el código 9999 que significa 'no sabe'. No es un monto real: hay que depurarlo antes de sumar o promediar y, de ser posible, recuperar el dato.",
+    "F11 Centinela 9999 en gastos/ingreso": "Algún campo de gastos o de ingreso tiene el código 9999 que significa 'no sabe'. No es un monto real: hay que depurarlo antes de sumar o promediar.",
+    # Parcelas
     "P01 Área parcela = 0": "La parcela tiene área cero o negativa, lo cual no es posible si se cultivó en ella. Falta el dato real de superficie; recuperarlo con el encuestador.",
     "P02 Área parcela >500 mz": "La parcela supera las 500 manzanas, una extensión enorme para el perfil de los beneficiarios. Casi seguro es un error de unidad o de digitación.",
     "P03 Árboles plantados > existentes": "Se reportan más árboles plantados en los últimos 12 meses que árboles existentes en total en la parcela. Como los plantados deberían estar incluidos en los existentes, hay una inconsistencia que revisar.",
     "P04 Qty fertilizante = 9999": "La cantidad de fertilizante tiene el código 9999 de 'no sabe'. Depurar antes de usar el dato y, si se puede, recuperarlo.",
     "P05 Qty agroquímico = 9999": "La cantidad de agroquímico tiene el código 9999 de 'no sabe'. Depurar antes de usar el dato y, si se puede, recuperarlo.",
+    # Cultivos
     "C01 Cosechada > Sembrada": "El área cosechada es mayor que el área sembrada (medidas en la misma unidad), lo cual no es posible. Uno de los dos valores está mal capturado.",
     "C02 Producción=0, área>0": "Se sembró un área mayor a cero pero la producción reportada es cero. Puede ser una pérdida total real (sequía, plaga) o un dato faltante; conviene confirmar cuál de las dos.",
     "C03 Qty semilla = 9999": "La cantidad de semilla tiene el código 9999 de 'no sabe'. No es un valor real; depurar y de ser posible recuperar el dato.",
@@ -522,6 +554,50 @@ def seccion_faltantes(d: pd.DataFrame, claves, modulo: str):
         b.dataframe(t2, width="stretch")
 
 
+def seccion_mapa(d: pd.DataFrame):
+    """Mapa de puntos GPS para control de calidad de campo. Los puntos se
+    identifican SOLO por ID (sin nombres). Uso interno del equipo."""
+    lat_c = resolve(d, "_latitude")
+    lon_c = resolve(d, "_longitude")
+    if lat_c is None or lon_c is None:
+        return
+    pts = pd.DataFrame({
+        "lat": num(d[lat_c]),
+        "lon": num(d[lon_c]),
+        "ID": id_encuesta(d),
+        "Encuestador": col(d, K_ENUM).astype(str),
+        "Distrito": col(d, "Distrito").astype(str),
+    }).dropna(subset=["lat", "lon"])
+    if pts.empty:
+        return
+    st.subheader("🗺 Mapa de puntos GPS (control de calidad)")
+    st.caption("Puntos identificados únicamente por ID, para verificar cobertura "
+               "y ubicaciones atípicas. Uso interno del equipo — no difundir "
+               "capturas de este mapa fuera del proyecto.")
+    # El Salvador: lat 12.9–14.5, lon -90.2 – -87.6
+    fuera = ~(pts["lat"].between(12.9, 14.5) & pts["lon"].between(-90.2, -87.6))
+    if fuera.any():
+        st.warning("⚠ Punto(s) fuera de El Salvador — revisar GPS: IDs "
+                   + ", ".join("#" + i for i in pts.loc[fuera, "ID"]))
+    try:
+        fig = px.scatter_map(pts, lat="lat", lon="lon", color="Encuestador",
+                             hover_name="ID", hover_data={"lat": False, "lon": False,
+                                                          "Distrito": True},
+                             zoom=8, height=480)
+        fig.update_layout(map_style="open-street-map",
+                          margin=dict(l=0, r=0, t=10, b=0))
+    except Exception:  # versiones previas de plotly
+        fig = px.scatter_mapbox(pts, lat="lat", lon="lon", color="Encuestador",
+                                hover_name="ID", zoom=8, height=480)
+        fig.update_layout(mapbox_style="open-street-map",
+                          margin=dict(l=0, r=0, t=10, b=0))
+    fig.update_traces(marker=dict(size=10))
+    st.plotly_chart(fig, width="stretch")
+    sin_gps = len(d) - len(pts)
+    if sin_gps > 0:
+        st.caption(f"{sin_gps} encuesta(s) sin coordenadas no aparecen en el mapa.")
+
+
 def tabla_flags(d: pd.DataFrame, flags: pd.DataFrame):
     st.subheader("⚠ Registros con flags")
     st.caption("Sin datos personales: use el ID para ubicar el registro en Kobo.")
@@ -555,7 +631,7 @@ def ficha_encuestado(d: pd.DataFrame, flags: pd.DataFrame, book: dict = None,
     elegido = st.selectbox("Seleccione la encuesta por ID",
                            "ID " + ids, key=f"ficha_{modulo}")
     i = ids.index[("ID " + ids) == elegido][0]
-    fila = quitar_sensibles(d.to_frame().T if isinstance(d, pd.Series) else d).loc[i]
+    fila = quitar_sensibles(d).loc[i]
 
     activos = [f for f in flags.columns if flags.at[i, f]]
     if activos:
@@ -641,6 +717,7 @@ def render_modulo(book: dict, esperado: str, nombre: str):
     diccionario_flags(nombres_flags)
     tabla_flags(d, flags)
     seccion_faltantes(d, claves, esperado)
+    seccion_mapa(d)
     if esperado == "AGRICOLA":
         st.divider()
         seccion_roster(book, d, "roster_parcela", flags_parcela,
