@@ -1042,20 +1042,131 @@ def reporte_acumulado_docx(d: pd.DataFrame, flags: pd.DataFrame,
     return buf.getvalue()
 
 
+# ----------------------------------------------------------------------------
+# Base marcada (.xlsx): amarillo = faltante en pregunta clave, rojo = flag
+# ----------------------------------------------------------------------------
+# Columnas a pintar de rojo cuando el flag del registro está activo
+CELDAS_FLAG = {
+    "SCALL": [
+        ("S02 Edad <18, >90 o faltante", [["edad de la jefa o jefe de hogar", "edad del productor"]]),
+        ("S03 Cantón o caserío vacío", ["Cantón", "Caserío"]),
+        ("S04 Sin identificador del encuestado", ["Identificador de encuestado"]),
+        ("S06 Sin relación con el jefe de hogar", ["relación con el jefe de hogar"]),
+        ("S08 Año SCALL ≤2022 o no es un año", ["año que le instalaron"]),
+        ("S09 Días tanque lleno >365", ["dias le duraria un tanque lleno"]),
+        ("S10 Meses de aporte >12", [["meses al año su scall aporta", "cuantos meses aporta agua"]]),
+        ("S11a No desplegada: quién realiza el mantenimiento", ["Quién realiza el mantenimiento habitual"]),
+        ("S11b No desplegada: tipo de capacitación", ["Qué tipo de capacitación recibió"]),
+        ("S11c No desplegada: componentes observados", ["componentes observó a partir de su inspección visual"]),
+        ("S11d No desplegada: frecuencia de limpieza", ["frecuencia se da limpieza"]),
+        ("S12 Sin fecha de entrevista", ["Fecha de la entrevista"]),
+    ],
+    "Agrícola": [
+        ("F02 Edad atípica", ["edad del productor"]),
+        ("F03 Hogar >15 personas", ["personas habitan al dia de hoy"]),
+        ("F04 Gasto semilla >$5,000", ["compra de la SEMILLA"]),
+        ("F05 Gasto fertilizantes >$5,000", ["compra de FERTILIZANTES"]),
+        ("F06 Gasto agroquímicos >$5,000", ["AGROQUIMICOS"]),
+        ("F07 Gasto mano obra >$10,000", ["mano de obra o jornales"]),
+        ("F08 Ingreso ventas >$50,000", ["ingreso total obtenido por la venta"]),
+        ("F09 Ingresos >> gastos x10", ["ingreso total obtenido por la venta"]),
+        ("F10 Más parcelas que cultivos", ["TERRENOS o PARCELAS", "CULTIVOS tuvo en total"]),
+        ("F11 Centinela 9999 en gastos/ingreso",
+         ["compra de la SEMILLA", "compra de FERTILIZANTES", "AGROQUIMICOS",
+          "mano de obra o jornales", "ingreso total obtenido por la venta"]),
+        ("G02 Fecha de entrevista vacía", ["Fecha de la entrevista"]),
+    ],
+}
+
+
+def excel_marcado(d: pd.DataFrame, flags: pd.DataFrame, claves,
+                  modulo: str) -> bytes:
+    """La base (sin datos personales) con faltantes en amarillo y flags en rojo."""
+    from openpyxl.styles import PatternFill, Font
+    AMARILLO = PatternFill("solid", fgColor="FFF3B0")
+    ROJO = PatternFill("solid", fgColor="F5A6A6")
+
+    base = quitar_sensibles(d).copy()
+    base.insert(0, "FLAGS", flags.apply(
+        lambda r: ", ".join(f.split(" ")[0] for f in flags.columns if r[f]), axis=1))
+    base.insert(0, "ID", id_encuesta(d))
+
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        base.to_excel(w, index=False, sheet_name="BASE")
+        # hoja de leyenda + resumen
+        resumen = flags.sum()
+        leyenda = pd.DataFrame(
+            [("AMARILLO", "Dato faltante en pregunta clave/obligatoria"),
+             ("ROJO", "Dato con flag de calidad (ver columna FLAGS)"),
+             ("", "")]
+            + [(k, f"{int(v)} caso(s)") for k, v in resumen.items() if v > 0],
+            columns=["Marca / Flag", "Significado / Casos"])
+        leyenda.to_excel(w, index=False, sheet_name="LEYENDA")
+
+        ws = w.book["BASE"]
+        ws.freeze_panes = "C2"
+        pos = {c: j + 1 for j, c in enumerate(base.columns)}
+
+        # amarillo: faltantes en preguntas clave (si la columna está en el export)
+        for _, key in claves:
+            c = resolve(d, key)
+            if c is None or c not in pos:
+                continue
+            vc = vacios(d[c])
+            for r_i, idx in enumerate(d.index):
+                if vc.loc[idx]:
+                    ws.cell(row=r_i + 2, column=pos[c]).fill = AMARILLO
+
+        # rojo: celda específica del dato con flag
+        for flag_name, keys in CELDAS_FLAG.get(modulo, []):
+            if flag_name not in flags.columns:
+                continue
+            for key in keys:
+                c = resolve(d, key)
+                if c is None or c not in pos:
+                    continue
+                for r_i, idx in enumerate(d.index):
+                    if flags.at[idx, flag_name]:
+                        ws.cell(row=r_i + 2, column=pos[c]).fill = ROJO
+
+        # rojo en la columna FLAGS para toda fila con al menos un flag
+        con_flag = flags.any(axis=1)
+        for r_i, idx in enumerate(d.index):
+            if con_flag.loc[idx]:
+                ws.cell(row=r_i + 2, column=pos["FLAGS"]).fill = ROJO
+        for celda in ws[1]:
+            celda.font = Font(bold=True)
+        ws.column_dimensions["A"].width = 22
+        ws.column_dimensions["B"].width = 28
+    return buf.getvalue()
+
+
 def seccion_reporte(d: pd.DataFrame, flags: pd.DataFrame, notas: pd.DataFrame,
                     modulo: str):
     st.divider()
     st.subheader("📄 Reporte para supervisores (acumulado)")
-    extra = st.text_input("Observaciones (opcional, se incluyen en el reporte)",
+    extra = st.text_input("Observaciones (opcional, se incluyen en el reporte Word)",
                           key=f"rep_obs_{modulo}")
-    data = reporte_acumulado_docx(d, flags, notas, modulo, extra)
-    st.download_button(
-        "⬇️ Descargar reporte (.docx)",
-        data=data,
+    claves = CLAVES_SCALL if modulo == "SCALL" else CLAVES_AGRI
+    a, b = st.columns(2)
+    a.download_button(
+        "⬇️ Base marcada (.xlsx) — faltantes en amarillo, flags en rojo",
+        data=excel_marcado(d, flags, claves, modulo),
+        file_name=f"Base_marcada_RECLIMA_{modulo}_{datetime.now():%Y-%m-%d}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key=f"rep_xl_{modulo}",
+    )
+    b.download_button(
+        "⬇️ Reporte para supervisores (.docx)",
+        data=reporte_acumulado_docx(d, flags, notas, modulo, extra),
         file_name=f"Reporte_RECLIMA_{modulo}_{datetime.now():%Y-%m-%d}.docx",
         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         key=f"rep_dl_{modulo}",
     )
+    st.caption("El Excel es la base completa (sin datos personales) con cada dato "
+               "faltante en amarillo y cada dato con flag en rojo, más una hoja "
+               "LEYENDA. Ideal para depurar registro por registro.")
 
 
 # ----------------------------------------------------------------------------
