@@ -180,6 +180,12 @@ def _kobo(d):
 
 
 def id_encuesta(d: pd.DataFrame) -> pd.Series:
+    # Si el usuario creó una llave propia (INDEX), esa es el identificador
+    # visible del registro (única y siempre presente).
+    for k in K_LLAVE_DATA:
+        c = resolve(d, k, exact=True)
+        if c is not None:
+            return d[c].astype(str).str.strip()
     kobo = _kobo(d)
     id_c = resolve(d, K_ID)
     if id_c is not None:
@@ -243,7 +249,39 @@ def detect_module(book: dict):
 # Geometría (polígonos de parcela)
 # ----------------------------------------------------------------------------
 M2_POR_MANZANA = 6989.0
-FACTOR_AREA = {"Manzanas": 6989.0, "Tareas": 437.0}
+# Factores de conversión a METROS CUADRADOS según la unidad que reporta el
+# productor. La comparación de áreas siempre se hace en m².
+def factor_a_m2(unidad):
+    u = _norm(unidad)
+    if "manzana" in u:
+        return 6989.0            # 1 manzana = 6,989 m²
+    if "hectarea" in u:
+        return 10000.0           # 1 ha = 10,000 m²
+    if "tarea" in u:
+        return 437.0             # 1 tarea = 437 m² (1/16 de manzana)
+    if "vara" in u:
+        return 0.698737          # 1 vara² ≈ 0.6987 m²
+    if "cuerda" in u:
+        return 436.6             # aprox. (variable por región)
+    if "metro" in u or u.strip() in ("m2", "m²"):
+        return 1.0
+    return None
+
+
+def area_declarada_m2(area, unidad, especifique=None):
+    """Devuelve (área en m², texto de la unidad). Si la unidad es 'Otra',
+    usa el campo Especifique. Si no se puede convertir, devuelve (NaN, texto)."""
+    a = pd.to_numeric(pd.Series([area]), errors="coerce").iloc[0]
+    if pd.isna(a) or a <= 0:
+        return np.nan, "—"
+    fac = factor_a_m2(unidad)
+    txt = str(unidad)
+    if fac is None and especifique and str(especifique).strip() not in ("", "nan", "None"):
+        fac = factor_a_m2(especifique)
+        txt = str(especifique)
+    if fac is None:
+        return np.nan, f"{a:g} {unidad} (unidad no convertible)"
+    return a * fac, f"{a:g} {txt}"
 
 
 def parse_geoshape(s):
@@ -288,11 +326,17 @@ FLAG_DESC = {
         "Revisar por qué no se registró el detalle. No marca los casos donde el "
         "roster tiene más filas que lo declarado (un cultivo en varias parcelas "
         "genera varias filas y no es un error).",
-    "A2 Georreferenciación no confiable":
-        "El polígono de la parcela es incoherente: su área calculada por GPS difiere "
-        "más de 3 veces del área declarada, o es una geometría degenerada (menos de 3 "
-        "vértices, área casi nula, o precisión GPS peor a 15 m). También marca los "
-        "casos que autorizaron GPS pero no capturaron el polígono. Verificar en campo.",
+    "A2 Polígono pendiente":
+        "El productor autorizó registrar el polígono de la parcela, pero éste quedó "
+        "marcado como PENDIENTE: aún no se ha medido en campo. Es un pendiente "
+        "operativo del levantamiento, no un error de dato.",
+    "A3 Medida del polígono muy diferente":
+        "El área del polígono medida por GPS (en metros cuadrados) es muy diferente "
+        "del área que declaró el productor, una vez convertida a metros cuadrados "
+        "según su unidad (manzanas, tareas, hectáreas o varas). Se marca cuando la "
+        "medida difiere más de 3 veces de la declarada, o cuando la geometría es "
+        "degenerada (menos de 3 vértices o área casi nula). Sugiere un error de trazo "
+        "del polígono o de la superficie declarada; verificar en campo.",
     "S Composición del hogar incompleta":
         "Falta la composición del hogar (total de personas, mujeres, hombres). Puede "
         "deberse a la lógica de salto del formulario o a una omisión; conviene "
@@ -434,42 +478,42 @@ def flags_agricola(d: pd.DataFrame, book: dict = None) -> pd.DataFrame:
             a1.iloc[i] = bool(falta_parc or falta_cult)
     f["A1 Módulo productivo incompleto"] = a1
 
-    # A2 — georreferenciación no confiable
+    # A2 — polígono pendiente ; A3 — medida del polígono muy diferente
     geo_c = resolve(d, "coordenadas de la esquina de la parcela")
-    aut_c = resolve(d, "autoriza registrar las coordenadas")
-    a2 = pd.Series(False, index=d.index)
+    a2 = pd.Series(False, index=d.index)   # pendiente
+    a3 = pd.Series(False, index=d.index)   # medida muy diferente
     if geo_c is not None:
         rp = pick_sheet(book, "roster_parcela") if book else None
         ac = resolve(rp, "el area de") if rp is not None else None
         uc = resolve(rp, "M1_Q6b", exact=True) if rp is not None else None
+        esp_c = resolve(rp, "Especifique", exact=True) if rp is not None else None
         for i in d.index:
             v = d.at[i, geo_c]
-            autorizo = (aut_c is not None
-                        and str(d.at[i, aut_c]).strip().startswith("Sí"))
+            txt = str(v).strip() if v is not None else ""
             tiene_poly = isinstance(v, str) and ";" in str(v)
-            if autorizo and not tiene_poly:
+            # A2: el polígono quedó marcado como PENDIENTE (autorizado, sin medir)
+            if txt.upper() == "PENDIENTE":
                 a2.iloc[i] = True
                 continue
             if not tiene_poly:
                 continue
+            # A3: comparar área medida (m²) vs área declarada convertida a m²
             pts = parse_geoshape(v)
-            am = area_poligono_m2(pts)
-            precs = [p[2] for p in pts if not pd.isna(p[2])]
-            prec = float(np.mean(precs)) if precs else np.nan
-            ratio = np.nan
+            am = area_poligono_m2(pts)          # ya en m²
+            decl_m2 = np.nan
             if rp is not None and ac is not None:
                 mias = parcelas_de_encuesta(book, kd.iloc[i])
                 if mias is not None and len(mias):
-                    ar = num(mias[ac]).iloc[0]
-                    un = str(mias[uc].iloc[0]) if uc else ""
-                    fac = FACTOR_AREA.get(un)
-                    if fac and not pd.isna(ar) and ar > 0:
-                        ratio = am / (ar * fac)
-            malo = (len(pts) < 3 or am < 50
-                    or (not pd.isna(prec) and prec > 15)
-                    or (not pd.isna(ratio) and (ratio > 3 or ratio < 1/3)))
-            a2.iloc[i] = bool(malo)
-    f["A2 Georreferenciación no confiable"] = a2
+                    esp = mias[esp_c].iloc[0] if esp_c is not None else None
+                    decl_m2, _ = area_declarada_m2(
+                        mias[ac].iloc[0],
+                        str(mias[uc].iloc[0]) if uc else "", esp)
+            muy_dif = (len(pts) < 3 or am < 50
+                       or (not pd.isna(decl_m2) and decl_m2 > 0
+                           and (am / decl_m2 > 3 or am / decl_m2 < 1/3)))
+            a3.iloc[i] = bool(muy_dif)
+    f["A2 Polígono pendiente"] = a2
+    f["A3 Medida del polígono muy diferente"] = a3
 
     # X — contradicciones lógicas
     edad = num(col(d, "edad del productor"))
@@ -705,52 +749,57 @@ def seccion_poligonos(d, book):
     rp = pick_sheet(book, "roster_parcela")
     ac = resolve(rp, "el area de") if rp is not None else None
     uc = resolve(rp, "M1_Q6b", exact=True) if rp is not None else None
+    esp_c = resolve(rp, "Especifique", exact=True) if rp is not None else None
 
+    n_pendiente = 0
     regs, shapes = [], []
     for i in d.index:
         v = d.at[i, geo_c]
+        if isinstance(v, str) and v.strip().upper() == "PENDIENTE":
+            n_pendiente += 1
+            continue
         if not (isinstance(v, str) and ";" in str(v)):
             continue
         pts = parse_geoshape(v)
         if not pts:
             continue
-        am = area_poligono_m2(pts)
+        am = area_poligono_m2(pts)                      # m²
         precs = [p[2] for p in pts if not pd.isna(p[2])]
         prec = float(np.mean(precs)) if precs else np.nan
-        rep_txt, ratio = "—", np.nan
+        rep_txt, decl_m2, ratio = "—", np.nan, np.nan
         if rp is not None and ac is not None:
             mias = parcelas_de_encuesta(book, kd.iloc[i])
             if mias is not None and len(mias):
-                ar = num(mias[ac]).iloc[0]
-                un = str(mias[uc].iloc[0]) if uc else ""
-                if not pd.isna(ar):
-                    rep_txt = f"{ar:g} {un}"
-                    fac = FACTOR_AREA.get(un)
-                    if fac and ar > 0:
-                        ratio = am / (ar * fac)
+                esp = mias[esp_c].iloc[0] if esp_c is not None else None
+                decl_m2, rep_txt = area_declarada_m2(
+                    mias[ac].iloc[0], str(mias[uc].iloc[0]) if uc else "", esp)
+                if not pd.isna(decl_m2) and decl_m2 > 0:
+                    ratio = am / decl_m2
         al = []
         if len(pts) < 3:
             al.append("< 3 vértices")
         if am < 50:
             al.append("área ≈ 0")
-        if not pd.isna(prec) and prec > 15:
-            al.append(f"precisión {prec:.0f} m")
         if not pd.isna(ratio) and (ratio > 3 or ratio < 1/3):
-            al.append(f"difiere de lo reportado (x{ratio:.1f})")
+            al.append(f"medida muy diferente (x{ratio:.1f})")
         regs.append({
             "ID": ids.loc[i], "Vértices": len(pts),
+            "Área medida (m²)": round(am),
             "Área medida (mz)": round(am / M2_POR_MANZANA, 2),
-            "Área reportada": rep_txt,
-            "Precisión (m)": round(prec, 1) if not pd.isna(prec) else "—",
+            "Área declarada": rep_txt,
+            "Área declarada (m²)": round(decl_m2) if not pd.isna(decl_m2) else "—",
             "⚠ Revisar": "; ".join(al) if al else "✔",
         })
         shapes.append((ids.loc[i], pts))
+    if n_pendiente:
+        st.info(f"📌 {n_pendiente} parcelas con polígono **PENDIENTE** de medir "
+                f"({n_pendiente/len(d):.0%} del total).")
     if not regs:
         return
 
     st.subheader("📐 Polígonos de parcela (control de calidad)")
-    st.caption("Área medida desde el GPS vs. área declarada. Identificados solo por ID. "
-               "Uso interno del equipo.")
+    st.caption("Área medida por GPS (en m²) vs. área declarada convertida a m² según "
+               "su unidad. Identificados solo por ID. Uso interno del equipo.")
     st.dataframe(pd.DataFrame(regs), hide_index=True, width="stretch")
 
     import plotly.graph_objects as go
@@ -894,6 +943,32 @@ def excel_marcado(d, flags, claves, modulo):
     return buf.getvalue()
 
 
+def excel_dummies(d, flags, book, modulo):
+    """Devuelve el MISMO libro (todas las hojas y columnas idénticas) y, en la
+    hoja principal, agrega una columna dummy 0/1 por bandera: 1 si el registro
+    dispara esa bandera, 0 si no. Para revisar las banderas sobre la base cruda."""
+    dummies = pd.DataFrame(
+        {f"BANDERA_{f.split(' ')[0]}": flags[f].astype(int).to_numpy()
+         for f in flags.columns},
+        index=range(len(d)))
+    main_cols = list(d.columns)
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        escritas = set()
+        for name, sheet in (book.items() if book else [("DATA", d)]):
+            hoja = name[:31]
+            if list(sheet.columns) == main_cols and len(sheet) == len(d) and "main" not in escritas:
+                out = pd.concat([d.reset_index(drop=True), dummies], axis=1)
+                out.to_excel(w, index=False, sheet_name=hoja)
+                escritas.add("main")
+            else:
+                sheet.to_excel(w, index=False, sheet_name=hoja)
+        if "main" not in escritas:  # por si no se identificó la hoja principal
+            pd.concat([d.reset_index(drop=True), dummies], axis=1).to_excel(
+                w, index=False, sheet_name="DATA_con_banderas")
+    return buf.getvalue()
+
+
 def resumen_pdf(d, flags, modulo, extra=""):
     """Resumen de 1 página en PDF (reportlab)."""
     from reportlab.lib.pagesizes import letter
@@ -1023,6 +1098,7 @@ def analisis_poligonos(d, book):
     rp = pick_sheet(book, "roster_parcela")
     ac = resolve(rp, "el area de") if rp is not None else None
     uc = resolve(rp, "M1_Q6b", exact=True) if rp is not None else None
+    esp_c = resolve(rp, "Especifique", exact=True) if rp is not None else None
     out = []
     for i in d.index:
         v = d.at[i, geo_c]
@@ -1031,35 +1107,31 @@ def analisis_poligonos(d, book):
         pts = parse_geoshape(v)
         if not pts:
             continue
-        am = area_poligono_m2(pts)
-        precs = [p[2] for p in pts if not pd.isna(p[2])]
-        prec = float(np.mean(precs)) if precs else np.nan
-        rep_txt, ratio = "—", np.nan
+        am = area_poligono_m2(pts)                       # m²
+        rep_txt, decl_m2, ratio = "—", np.nan, np.nan
         if rp is not None and ac is not None:
             mias = parcelas_de_encuesta(book, kd.iloc[i])
             if mias is not None and len(mias):
-                ar = num(mias[ac]).iloc[0]
-                un = str(mias[uc].iloc[0]) if uc else ""
-                if not pd.isna(ar):
-                    rep_txt = f"{ar:g} {un}"
-                    fac = FACTOR_AREA.get(un)
-                    if fac and ar > 0:
-                        ratio = am / (ar * fac)
+                esp = mias[esp_c].iloc[0] if esp_c is not None else None
+                decl_m2, rep_txt = area_declarada_m2(
+                    mias[ac].iloc[0], str(mias[uc].iloc[0]) if uc else "", esp)
+                if not pd.isna(decl_m2) and decl_m2 > 0:
+                    ratio = am / decl_m2
         motivos = []
         if len(pts) < 3:
             motivos.append("menos de 3 vértices")
         if am < 50:
             motivos.append("área casi nula (≈0)")
-        if not pd.isna(prec) and prec > 15:
-            motivos.append(f"precisión GPS mala ({prec:.0f} m)")
         if not pd.isna(ratio) and (ratio > 3 or ratio < 1/3):
-            motivos.append(f"área medida difiere de la declarada (x{ratio:.1f})")
+            motivos.append(f"medida muy diferente de la declarada (x{ratio:.1f})")
         out.append({
             "INDEX": ident.at[i, "INDEX"],
             "Identificador": ident.at[i, "Identificador de encuestado"],
             "Vertices": len(pts),
+            "Area_medida_m2": round(am),
             "Area_medida_mz": round(am / M2_POR_MANZANA, 2),
             "Area_declarada": rep_txt,
+            "Area_declarada_m2": round(decl_m2) if not pd.isna(decl_m2) else "—",
             "motivos": motivos,
             "desconfiable": bool(motivos),
         })
@@ -1152,18 +1224,29 @@ def reporte_docx(d, flags, modulo, extra="", book=None):
 
     # 6. Polígonos desconfiables (solo Agrícola)
     polys = analisis_poligonos(d, book) if modulo != "SCALL" else []
-    if polys:
-        doc.add_heading("6. Polígonos de parcela que no cuadran", 1)
+    geo_c0 = resolve(d, "coordenadas de la esquina de la parcela")
+    n_pend = int(d[geo_c0].astype(str).str.strip().str.upper().eq("PENDIENTE").sum()) if geo_c0 is not None else 0
+    if polys or n_pend:
+        doc.add_heading("6. Polígonos de parcela", 1)
+        if n_pend:
+            doc.add_paragraph(
+                f"{n_pend} parcelas tienen el polígono marcado como PENDIENTE de medir "
+                f"({n_pend/len(d):.0%} del total): el productor autorizó el registro pero "
+                "aún no se ha levantado.")
         malos = [p for p in polys if p["desconfiable"]]
         doc.add_paragraph(
-            f"Se capturaron {len(polys)} polígonos de parcela. De ellos, {len(malos)} "
-            "resultan desconfiables según al menos uno de estos criterios: menos de 3 "
-            "vértices; área calculada casi nula (≈0); precisión GPS peor a 15 m; o área "
-            "medida que difiere más de 3 veces del área declarada por el productor.")
+            f"Se capturaron {len(polys)} polígonos. El área medida por GPS se calcula en "
+            "metros cuadrados y se compara con el área declarada por el productor, "
+            "convertida a metros cuadrados según su unidad (manzanas, tareas, hectáreas o "
+            f"varas). De ellos, {len(malos)} resultan desconfiables por al menos uno de "
+            "estos criterios: menos de 3 vértices; área casi nula; o medida que difiere "
+            "más de 3 veces de la declarada.")
         if malos:
-            _tab(["INDEX", "Identificador", "Vért.", "Área medida (mz)", "Área declarada", "Motivo"],
-                 [[p["INDEX"], p["Identificador"], p["Vertices"], p["Area_medida_mz"],
-                   p["Area_declarada"], "; ".join(p["motivos"])] for p in malos])
+            _tab(["INDEX", "Identificador", "Vért.", "Medida (m²)", "Declarada (m²)",
+                  "Declarada", "Motivo"],
+                 [[p["INDEX"], p["Identificador"], p["Vertices"], p["Area_medida_m2"],
+                   p["Area_declarada_m2"], p["Area_declarada"], "; ".join(p["motivos"])]
+                  for p in malos])
         # nota de polígonos sin asignar
         sin = poligonos_sin_asignar(book) if book else []
         if sin:
@@ -1201,9 +1284,18 @@ def seccion_reporte(d, flags, modulo, book=None):
         file_name=f"Reporte_RECLIMA_{modulo}_{hoy}.docx",
         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         key=f"doc_{modulo}", width="stretch")
-    st.caption("El PDF es un resumen ejecutivo; el Excel es la base con faltantes en "
-               "amarillo y banderas en rojo; el Word detalla los IDs por bandera. "
-               "Ninguno incluye datos personales.")
+    st.download_button(
+        "🧮 Base idéntica + columnas dummy por bandera (.xlsx)",
+        data=excel_dummies(d, flags, book, modulo),
+        file_name=f"Base_dummies_{modulo}_{hoy}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key=f"dummy_{modulo}", width="stretch")
+    st.caption("El PDF es un resumen ejecutivo; la base marcada tiene faltantes en "
+               "amarillo y banderas en rojo (sin datos personales); el Word detalla "
+               "los registros por bandera. La **base idéntica + dummies** es el mismo "
+               "archivo del hosting, con las mismas columnas, más una columna 0/1 por "
+               "bandera (1 = aplica) para revisarlas sobre la base cruda — incluye "
+               "todos los campos, es para revisión interna del administrador.")
 
 
 # ----------------------------------------------------------------------------
