@@ -6,10 +6,13 @@ consulta con enlace + contraseña. El tablero NO muestra datos personales
 de los entrevistados (solicitud FAO): solo el ID (PRODUCTOS-ID ENCUESTA).
 
 Banderas sustantivas (derivadas del análisis de calidad, jul 2026):
-  A1 Módulo productivo incompleto (Agrícola)
-  A2 Georreferenciación no confiable (Agrícola)
-  Q  Registro no trazable — sin identificador (ambos)
-  S  Composición del hogar incompleta (SCALL)
+  Q   Registro no trazable — sin identificador (ambos)
+  S   Composición del hogar incompleta (SCALL)
+  X   Contradicción lógica (ambos módulos)
+  A1a Sin cultivos capturados (Agrícola)
+  A1b Roster productivo incompleto — menos de lo declarado (Agrícola)
+  A2  Polígono pendiente de medir (Agrícola)
+  A3  Medida del polígono muy diferente a la declarada (Agrícola)
 """
 
 import io
@@ -318,14 +321,16 @@ FLAG_DESC = {
         "El registro no tiene el PRODUCTOS-ID ENCUESTA. Sin ese identificador no se "
         "puede vincular la encuesta con el marco muestral de beneficiarios ni dar "
         "seguimiento. Se corrige recuperando el ID con el encuestador.",
-    "A1 Módulo productivo incompleto":
-        "El roster capturó MENOS parcelas o cultivos de los que el productor declaró "
-        "(o el roster de cultivos quedó vacío pese a declarar cultivos). Falta el "
-        "detalle productivo (área sembrada, producción, rendimiento), que es el dato "
-        "central de la evaluación agrícola: sin él no se puede medir productividad. "
-        "Revisar por qué no se registró el detalle. No marca los casos donde el "
-        "roster tiene más filas que lo declarado (un cultivo en varias parcelas "
-        "genera varias filas y no es un error).",
+    "A1a Sin cultivos capturados":
+        "El productor declaró tener cultivos, pero el roster de cultivos está "
+        "completamente VACÍO: no se registró ninguno (sin área sembrada, producción "
+        "ni rendimiento). Es la pérdida más grave del dato productivo, central para "
+        "la evaluación agrícola. Revisar por qué no se levantó ningún cultivo.",
+    "A1b Roster productivo incompleto":
+        "El roster capturó ALGO pero MENOS de lo que el productor declaró: menos "
+        "cultivos, o menos parcelas de las declaradas. Falta parte del detalle "
+        "productivo. No marca cuando el roster tiene más filas que lo declarado (un "
+        "cultivo repartido en varias parcelas genera varias filas y no es un error).",
     "A2 Polígono pendiente":
         "El productor autorizó registrar el polígono de la parcela, pero éste quedó "
         "marcado como PENDIENTE: aún no se ha medido en campo. Es un pendiente "
@@ -459,8 +464,9 @@ def flags_agricola(d: pd.DataFrame, book: dict = None) -> pd.DataFrame:
     dec_p = num(col(d, "TERRENOS o PARCELAS"))
     dec_c = num(col(d, "CULTIVOS tuvo en total"))
 
-    # A1 — módulo productivo incompleto
-    a1 = pd.Series(False, index=d.index)
+    # A1a — sin ningún cultivo capturado ; A1b — capturó menos de lo declarado
+    a1a = pd.Series(False, index=d.index)
+    a1b = pd.Series(False, index=d.index)
     if book is not None:
         pcount = contar_roster_por_encuesta(book, "roster_parcela")
         cpe = contar_cultivos_por_encuesta(book)
@@ -469,14 +475,17 @@ def flags_agricola(d: pd.DataFrame, book: dict = None) -> pd.DataFrame:
             real_p = pcount.get(k, 0)
             real_c = cpe.get(k, 0)
             dp, dc = dec_p.iloc[i], dec_c.iloc[i]
-            # Marca solo FALTA de información: el roster capturó menos parcelas
-            # o menos cultivos de los que el productor declaró (incluye vacío).
-            # No marca cuando el roster tiene más (un cultivo en varias parcelas
-            # genera varias filas y no es un error).
-            falta_parc = (not pd.isna(dp)) and real_p < dp
-            falta_cult = (not pd.isna(dc)) and real_c < dc
-            a1.iloc[i] = bool(falta_parc or falta_cult)
-    f["A1 Módulo productivo incompleto"] = a1
+            # A1a: declaró cultivos pero el roster de cultivos está VACÍO (0).
+            sin_cult = (not pd.isna(dc)) and dc > 0 and real_c == 0
+            # A1b: capturó ALGO pero menos de lo declarado (cultivos o parcelas).
+            #      No marca cuando el roster tiene más (un cultivo en varias
+            #      parcelas genera varias filas y no es un error).
+            menos = (((not pd.isna(dc)) and 0 < real_c < dc)
+                     or ((not pd.isna(dp)) and real_p < dp))
+            a1a.iloc[i] = bool(sin_cult)
+            a1b.iloc[i] = bool(menos)
+    f["A1a Sin cultivos capturados"] = a1a
+    f["A1b Roster productivo incompleto"] = a1b
 
     # A2 — polígono pendiente ; A3 — medida del polígono muy diferente
     geo_c = resolve(d, "coordenadas de la esquina de la parcela")
