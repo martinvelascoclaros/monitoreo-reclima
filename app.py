@@ -1273,39 +1273,207 @@ def reporte_docx(d, flags, modulo, extra="", book=None):
     return buf.getvalue()
 
 
+def dashboard_pdf(d, flags, modulo, book=None):
+    """PDF con lo que se ve en el tablero: KPIs, resumen de banderas, avance de
+    campo y estadísticas, renderizado con matplotlib."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_pdf import PdfPages
+    VERDE, ROJO = "#2E7D46", "#D1495B"
+
+    enum_c = resolve(d, K_ENUM)
+    distr_c = resolve(d, "Distrito", exact=True) or resolve(d, "Distrito")
+    fechas = pd.to_datetime(col(d, "Fecha de la entrevista"), errors="coerce")
+    con = flags.any(axis=1)
+
+    buf = io.BytesIO()
+    with PdfPages(buf) as pdf:
+        # --- Página 1: título, KPIs, resumen de banderas ---
+        fig = plt.figure(figsize=(8.5, 11))
+        fig.suptitle(f"Monitoreo de calidad — RECLIMA {modulo}", fontsize=16,
+                     color=VERDE, weight="bold", y=0.97)
+        fv = fechas.dropna()
+        periodo = (f"{fv.min():%d/%m/%Y} – {fv.max():%d/%m/%Y}" if len(fv) else "—")
+        fig.text(0.5, 0.94, f"Periodo: {periodo}   ·   Generado: {datetime.now():%d/%m/%Y %H:%M}",
+                 ha="center", fontsize=8, color="#666")
+        # KPIs
+        kpis = [("Encuestas", len(d)),
+                ("Encuestadores", d[enum_c].nunique() if enum_c else "—"),
+                ("Distritos", d[distr_c].nunique() if distr_c else "—"),
+                ("Días de campo", int(fechas.dt.date.nunique())),
+                ("Con ≥1 bandera", f"{int(con.sum())} ({con.mean():.0%})" if len(d) else "0")]
+        for j, (lab, val) in enumerate(kpis):
+            x = 0.08 + j * 0.172
+            fig.text(x, 0.885, str(val), fontsize=15, color=VERDE, weight="bold", ha="center")
+            fig.text(x, 0.865, lab, fontsize=7.5, color="#555", ha="center")
+        # resumen de banderas (barra horizontal)
+        resumen = flags.sum()
+        resumen = resumen[resumen > 0].sort_values()
+        ax1 = fig.add_axes([0.30, 0.50, 0.62, 0.30])
+        if len(resumen):
+            ax1.barh([k.split(" ")[0] for k in resumen.index], resumen.values, color=ROJO)
+            for i, v in enumerate(resumen.values):
+                ax1.text(v, i, f" {int(v)}", va="center", fontsize=8)
+        ax1.set_title("Banderas de calidad (casos)", fontsize=10, color=VERDE, loc="left")
+        ax1.spines[["top", "right"]].set_visible(False)
+        # tabla de banderas con nombre
+        ax_t = fig.add_axes([0.06, 0.50, 0.22, 0.30]); ax_t.axis("off")
+        yy = 0.98
+        for k in resumen.sort_values(ascending=False).index:
+            ax_t.text(0, yy, k, fontsize=6.6, va="top", wrap=True)
+            yy -= 0.11
+        # estadísticas
+        ax_s = fig.add_axes([0.06, 0.06, 0.88, 0.38]); ax_s.axis("off")
+        ax_s.set_title("Estadísticas preliminares", fontsize=11, color=VERDE, loc="left")
+        stats = stats_datos(d, modulo)
+        yy = 0.90
+        for lab, val, *_ in stats:
+            ax_s.text(0.0, yy, lab, fontsize=8.5, va="top")
+            ax_s.text(0.95, yy, str(val), fontsize=8.5, va="top", ha="right",
+                      color=VERDE, weight="bold")
+            yy -= 0.075
+        pdf.savefig(fig); plt.close(fig)
+
+        # --- Página 2: avance de campo ---
+        fig2, axes = plt.subplots(3, 1, figsize=(8.5, 11))
+        fig2.suptitle("Avance de campo", fontsize=14, color=VERDE, weight="bold")
+        if distr_c:
+            vc = d[distr_c].value_counts()
+            axes[0].bar(range(len(vc)), vc.values, color=VERDE)
+            axes[0].set_xticks(range(len(vc))); axes[0].set_xticklabels(vc.index, rotation=60, ha="right", fontsize=6)
+            axes[0].set_title("Por distrito", fontsize=10, loc="left")
+        if enum_c:
+            vc = d[enum_c].value_counts()
+            axes[1].bar(range(len(vc)), vc.values, color=VERDE)
+            axes[1].set_xticks(range(len(vc))); axes[1].set_xticklabels(vc.index, rotation=45, ha="right", fontsize=7)
+            axes[1].set_title("Por encuestador", fontsize=10, loc="left")
+        if fechas.notna().any():
+            pd_ = fechas.dt.date.value_counts().sort_index()
+            axes[2].bar(range(len(pd_)), pd_.values, color=VERDE)
+            axes[2].set_xticks(range(len(pd_))); axes[2].set_xticklabels([f"{k:%d/%m}" for k in pd_.index], rotation=60, ha="right", fontsize=6)
+            axes[2].set_title("Encuestas por día", fontsize=10, loc="left")
+        for a in axes:
+            a.spines[["top", "right"]].set_visible(False)
+        fig2.tight_layout(rect=[0, 0, 1, 0.96])
+        pdf.savefig(fig2); plt.close(fig2)
+    return buf.getvalue()
+
+
+def poligonos_pdf(d, book):
+    """PDF con la figura de cada polígono de parcela, su identificador y si es
+    VÁLIDO o NO VÁLIDO según los controles de calidad."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_pdf import PdfPages
+    VERDE, ROJO = "#2E7D46", "#D1495B"
+
+    geo_c = resolve(d, "coordenadas de la esquina de la parcela")
+    if geo_c is None:
+        return None
+    ident = identificadores(d)
+    kc = clave_encuesta_data(d)
+    kd = d[kc].astype(str) if kc is not None else id_encuesta(d)
+    rp = pick_sheet(book, "roster_parcela") if book else None
+    ac = resolve(rp, "el area de") if rp is not None else None
+    uc = resolve(rp, "M1_Q6b", exact=True) if rp is not None else None
+    esp_c = resolve(rp, "Especifique", exact=True) if rp is not None else None
+
+    items = []
+    for i in d.index:
+        v = d.at[i, geo_c]
+        if not (isinstance(v, str) and ";" in str(v)):
+            continue
+        pts = parse_geoshape(v)
+        if not pts:
+            continue
+        am = area_poligono_m2(pts)
+        rep_txt, decl_m2, ratio = "—", np.nan, np.nan
+        if rp is not None and ac is not None:
+            mias = parcelas_de_encuesta(book, kd.iloc[i])
+            if mias is not None and len(mias):
+                esp = mias[esp_c].iloc[0] if esp_c is not None else None
+                decl_m2, rep_txt = area_declarada_m2(
+                    mias[ac].iloc[0], str(mias[uc].iloc[0]) if uc else "", esp)
+                if not pd.isna(decl_m2) and decl_m2 > 0:
+                    ratio = am / decl_m2
+        motivos = []
+        if len(pts) < 3:
+            motivos.append("< 3 vértices")
+        if am < 50:
+            motivos.append("área ≈ 0")
+        if not pd.isna(ratio) and (ratio > 3 or ratio < 1/3):
+            motivos.append(f"medida muy diferente (x{ratio:.1f})")
+        items.append({
+            "ID": ident.at[i, "INDEX"], "ident": ident.at[i, "Identificador de encuestado"],
+            "pts": pts, "am": am, "decl": rep_txt, "decl_m2": decl_m2,
+            "valido": not motivos, "motivos": motivos})
+    if not items:
+        return None
+
+    buf = io.BytesIO()
+    POR_PAG = 6  # 3 filas x 2 columnas
+    with PdfPages(buf) as pdf:
+        for k in range(0, len(items), POR_PAG):
+            fig, axes = plt.subplots(3, 2, figsize=(8.5, 11))
+            fig.suptitle("Polígonos de parcela — validación", fontsize=13,
+                         color=VERDE, weight="bold")
+            for ax, it in zip(axes.flat, items[k:k + POR_PAG]):
+                lats = [p[0] for p in it["pts"]] + [it["pts"][0][0]]
+                lons = [p[1] for p in it["pts"]] + [it["pts"][0][1]]
+                col_p = VERDE if it["valido"] else ROJO
+                ax.fill(lons, lats, alpha=0.25, color=col_p)
+                ax.plot(lons, lats, color=col_p, lw=1.5, marker="o", ms=3)
+                ax.set_aspect("equal", adjustable="datalim")
+                ax.ticklabel_format(useOffset=False, style="plain")
+                ax.tick_params(labelsize=5)
+                estado = "VÁLIDO" if it["valido"] else "NO VÁLIDO"
+                sub = (f"medida {it['am']:.0f} m²  ·  declarada {it['decl']}")
+                mot = ("" if it["valido"] else "\n" + "; ".join(it["motivos"]))
+                ax.set_title(f"{it['ID']}  ·  {it['ident'][:16]}\n"
+                             f"[{estado}]  {sub}{mot}",
+                             fontsize=7, color=col_p, weight="bold")
+            for ax in axes.flat[len(items[k:k + POR_PAG]):]:
+                ax.axis("off")
+            fig.tight_layout(rect=[0, 0, 1, 0.96])
+            pdf.savefig(fig); plt.close(fig)
+    return buf.getvalue()
+
+
 def seccion_reporte(d, flags, modulo, book=None):
     st.subheader("📤 Exportar")
     extra = st.text_input("Observaciones (opcional, se incluyen en los reportes)",
                           key=f"obs_{modulo}")
-    claves = CLAVES_SCALL if modulo == "SCALL" else CLAVES_AGRI
     hoy = f"{datetime.now():%Y-%m-%d}"
     c1, c2, c3 = st.columns(3)
     c1.download_button(
-        "📄 Resumen 1 página (.pdf)", data=resumen_pdf(d, flags, modulo, extra),
-        file_name=f"Resumen_RECLIMA_{modulo}_{hoy}.pdf", mime="application/pdf",
-        key=f"pdf_{modulo}", width="stretch")
-    c2.download_button(
-        "📊 Base marcada (.xlsx)", data=excel_marcado(d, flags, claves, modulo),
-        file_name=f"Base_marcada_{modulo}_{hoy}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        key=f"xl_{modulo}", width="stretch")
-    c3.download_button(
         "📝 Reporte (.docx)", data=reporte_docx(d, flags, modulo, extra, book=book),
         file_name=f"Reporte_RECLIMA_{modulo}_{hoy}.docx",
         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         key=f"doc_{modulo}", width="stretch")
-    st.download_button(
-        "🧮 Base idéntica + columnas dummy por bandera (.xlsx)",
+    c2.download_button(
+        "🧮 Base idéntica + dummies (.xlsx)",
         data=excel_dummies(d, flags, book, modulo),
         file_name=f"Base_dummies_{modulo}_{hoy}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         key=f"dummy_{modulo}", width="stretch")
-    st.caption("El PDF es un resumen ejecutivo; la base marcada tiene faltantes en "
-               "amarillo y banderas en rojo (sin datos personales); el Word detalla "
-               "los registros por bandera. La **base idéntica + dummies** es el mismo "
-               "archivo del hosting, con las mismas columnas, más una columna 0/1 por "
-               "bandera (1 = aplica) para revisarlas sobre la base cruda — incluye "
-               "todos los campos, es para revisión interna del administrador.")
+    c3.download_button(
+        "🖥 Dashboard en PDF", data=dashboard_pdf(d, flags, modulo, book),
+        file_name=f"Dashboard_RECLIMA_{modulo}_{hoy}.pdf", mime="application/pdf",
+        key=f"dash_{modulo}", width="stretch")
+    if modulo != "SCALL" and book is not None:
+        data_poly = poligonos_pdf(d, book)
+        if data_poly:
+            st.download_button(
+                "📐 Figuras de polígonos en PDF (con validez)", data=data_poly,
+                file_name=f"Poligonos_RECLIMA_{modulo}_{hoy}.pdf", mime="application/pdf",
+                key=f"poly_pdf_{modulo}", width="stretch")
+    st.caption("El Word detalla los registros por bandera; la base idéntica + dummies es "
+               "el mismo archivo del hosting con una columna 0/1 por bandera (para revisión "
+               "interna del administrador); el Dashboard en PDF reproduce lo que se ve en "
+               "el tablero. En Agrícola, el PDF de polígonos muestra cada figura con su "
+               "identificador y si es VÁLIDO o NO VÁLIDO.")
 
 
 # ----------------------------------------------------------------------------
