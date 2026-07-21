@@ -784,6 +784,119 @@ def seccion_poligonos(d, book):
     st.plotly_chart(fig2, width="stretch")
 
 
+def poligonos_sin_asignar(book):
+    """Lee la hoja 'Poligonos_SINASIGNAR' (polígonos cargados aparte,
+    identificados por código de beneficiario). Devuelve [(código, pts), ...]."""
+    sp = pick_sheet(book, "Poligonos_SINASIGNAR", "sin asignar", "sinasignar")
+    if sp is None or sp.shape[1] < 2:
+        return []
+    pcol, ccol = sp.columns[0], sp.columns[1]
+    out = []
+    for _, row in sp.iterrows():
+        poly = str(row[pcol])
+        cod = str(row[ccol]).strip()
+        if ";" not in poly:
+            continue
+        pts = parse_geoshape(poly)
+        if pts:
+            out.append((cod if cod and cod != "nan" else "(sin código)", pts))
+    return out
+
+
+def seccion_poligonos_extra(d, book):
+    """Polígonos agregados manualmente (hoja Poligonos_SINASIGNAR): medición y
+    mapa. Se identifican por código de beneficiario; se intenta enlazar al área
+    declarada si el código coincide con el identificador de una encuesta."""
+    sin = poligonos_sin_asignar(book)
+    if not sin:
+        return
+    st.subheader("➕ Polígonos agregados manualmente")
+    st.caption("Polígonos cargados aparte (hoja Poligonos_SINASIGNAR), identificados "
+               "por código de beneficiario. Se miden por GPS; no provienen de la "
+               "encuesta, por eso no tienen precisión GPS registrada.")
+    # mapa código -> área declarada (si el código coincide con un identificador)
+    id_c = resolve(d, K_ID)
+    rp = pick_sheet(book, "roster_parcela")
+    ac = resolve(rp, "el area de") if rp is not None else None
+    uc = resolve(rp, "M1_Q6b", exact=True) if rp is not None else None
+    kc = clave_encuesta_data(d)
+    id2key = {}
+    if id_c is not None and kc is not None:
+        id2key = dict(zip(d[id_c].astype(str).str.strip(), d[kc].astype(str)))
+
+    regs, shapes = [], []
+    for cod, pts in sin:
+        am = area_poligono_m2(pts)
+        rep_txt, ratio = "—", np.nan
+        if cod in id2key and rp is not None and ac is not None:
+            mias = parcelas_de_encuesta(book, id2key[cod])
+            if mias is not None and len(mias):
+                ar = num(mias[ac]).iloc[0]
+                un = str(mias[uc].iloc[0]) if uc else ""
+                if not pd.isna(ar):
+                    rep_txt = f"{ar:g} {un}"
+                    fac = FACTOR_AREA.get(un)
+                    if fac and ar > 0:
+                        ratio = am / (ar * fac)
+        al = []
+        if len(pts) < 3:
+            al.append("< 3 vértices")
+        if am < 50:
+            al.append("área ≈ 0")
+        if not pd.isna(ratio) and (ratio > 3 or ratio < 1/3):
+            al.append(f"difiere de lo reportado (x{ratio:.1f})")
+        regs.append({
+            "Código beneficiario": cod, "Vértices": len(pts),
+            "Área medida (mz)": round(am / M2_POR_MANZANA, 2),
+            "Área medida (m²)": round(am),
+            "Área declarada": rep_txt,
+            "⚠ Revisar": "; ".join(al) if al else "✔",
+        })
+        shapes.append((cod, pts))
+    st.dataframe(pd.DataFrame(regs), hide_index=True, width="stretch")
+    sin_match = sum(1 for c, _ in sin if c not in id2key)
+    if sin_match:
+        st.caption(f"Nota: {sin_match} de {len(sin)} códigos no coinciden con ningún "
+                   "identificador de encuesta de la base actual, por lo que no se "
+                   "puede comparar contra el área declarada. Verificar que el código "
+                   "del polígono use el mismo formato que el PRODUCTOS-ID ENCUESTA.")
+
+    import plotly.graph_objects as go
+    usa = hasattr(go, "Scattermap")
+    estilo = selector_estilo("est_poly_extra")
+    fig = go.Figure()
+    for cod, pts in shapes:
+        la = [p[0] for p in pts] + [pts[0][0]]
+        lo = [p[1] for p in pts] + [pts[0][1]]
+        tr = dict(lat=la, lon=lo, mode="lines+markers", fill="toself",
+                  name=cod, hovertext=cod)
+        fig.add_trace(go.Scattermap(**tr) if usa else go.Scattermapbox(**tr))
+    centro = dict(lat=float(np.mean([p[0] for _, ps in shapes for p in ps])),
+                  lon=float(np.mean([p[1] for _, ps in shapes for p in ps])))
+    key = "map" if usa else "mapbox"
+    fig.update_layout(**{key: dict(style=estilo, center=centro, zoom=11)},
+                      height=480, margin=dict(l=0, r=0, t=10, b=0))
+    st.plotly_chart(fig, width="stretch")
+
+    st.markdown("**🔎 Ver un polígono agregado**")
+    ops = [c for c, _ in shapes]
+    sel = st.selectbox("Seleccione el código", ops, key="poly_extra_sel")
+    if sel not in dict(shapes):
+        sel = ops[0]
+    pts_sel = dict(shapes)[sel]
+    st.dataframe(pd.DataFrame([next((r for r in regs if r["Código beneficiario"] == sel), regs[0])]),
+                 hide_index=True, width="stretch")
+    la = [p[0] for p in pts_sel] + [pts_sel[0][0]]
+    lo = [p[1] for p in pts_sel] + [pts_sel[0][1]]
+    tr = dict(lat=la, lon=lo, mode="lines+markers", fill="toself", name=sel)
+    fig2 = go.Figure(go.Scattermap(**tr) if usa else go.Scattermapbox(**tr))
+    c2 = dict(lat=float(np.mean([p[0] for p in pts_sel])),
+              lon=float(np.mean([p[1] for p in pts_sel])))
+    fig2.update_layout(**{key: dict(style=estilo, center=c2, zoom=16)},
+                       height=440, margin=dict(l=0, r=0, t=10, b=0), showlegend=False)
+    st.plotly_chart(fig2, width="stretch")
+
+
 def ficha_encuestado(d, flags, book=None, modulo=""):
     st.subheader("👤 Ficha de la encuesta")
     st.caption("Identificada solo por ID (sin datos personales). Los campos de nombres, "
@@ -1185,6 +1298,7 @@ def render_modulo(book, esperado, nombre):
     if esperado == "AGRICOLA":
         st.divider()
         _seccion("Polígonos de parcela", seccion_poligonos, d, book)
+        _seccion("Polígonos agregados manualmente", seccion_poligonos_extra, d, book)
     st.divider()
     _seccion("Mapa de puntos GPS", seccion_mapa, d, esperado)
     st.divider()
