@@ -256,19 +256,73 @@ FLAG_DESC = {
         "Falta la composición del hogar (total de personas, mujeres, hombres). Puede "
         "deberse a la lógica de salto del formulario o a una omisión; conviene "
         "verificar contra el XLSForm si el bloque debía desplegarse para este caso.",
+    "X Contradicción lógica (SCALL)":
+        "Hay respuestas internamente contradictorias: (a) dice usar el agua del SCALL "
+        "pero reporta 0 meses de aporte al año; (b) responde que NO tiene un SCALL "
+        "instalado, pese a estar en la muestra SCALL (posible problema de elegibilidad "
+        "o de captura); o (c) mujeres + hombres no suman el total de personas del "
+        "hogar. Revisar el registro para identificar cuál dato es el incorrecto.",
+    "X Contradicción lógica (Agrícola)":
+        "Hay respuestas internamente contradictorias: (a) edad del productor menor a 18 "
+        "o mayor a 90; (b) ingreso por ventas mayor a 10 veces el total de gastos "
+        "productivos (rentabilidad implausible, algún monto mal capturado); (c) un "
+        "cultivo con área sembrada mayor a cero pero producción cero (posible pérdida "
+        "total real o dato faltante); o (d) área cosechada mayor a la sembrada en la "
+        "misma unidad. Revisar el registro para verificar el dato.",
 }
+
+
+def _drop9999(s):
+    return s.mask(s == 9999).mask(s == 999)
 
 
 def flags_scall(d: pd.DataFrame, book: dict = None) -> pd.DataFrame:
     f = pd.DataFrame(index=d.index)
     f["Q Sin identificador (no trazable)"] = vacios(col(d, K_ID))
+    T = num(col(d, "personas habitan al dia de hoy"))
+    M = num(col(d, "cuantas son mujeres"))
+    H = num(col(d, "cuantas son hombres"))
     comp = [resolve(d, k) for k in ["personas habitan al dia de hoy",
                                     "cuantas son mujeres", "cuantas son hombres"]]
     comp = [c for c in comp if c is not None]
     if comp:
-        falta = pd.concat([vacios(d[c]) for c in comp], axis=1).any(axis=1)
-        f["S Composición del hogar incompleta"] = falta
+        f["S Composición del hogar incompleta"] = pd.concat(
+            [vacios(d[c]) for c in comp], axis=1).any(axis=1)
+    # X — contradicciones lógicas
+    usa = col(d, "el hogar usa agua del SCALL").astype(str)
+    mes = _drop9999(num(col(d, ["meses al año su scall aporta",
+                                "cuantos meses aporta agua"])).mask(lambda s: s == 99))
+    inst = col(d, "tiene instalado en su hogar un sistema").astype(str)
+    contra = ((usa.str.startswith("Sí") & (mes == 0))
+              | inst.str.startswith("No")
+              | (T.notna() & M.notna() & H.notna() & ((M + H) != T)))
+    f["X Contradicción lógica (SCALL)"] = contra.fillna(False)
     return f.fillna(False)
+
+
+def encuestas_contradiccion_cultivo(book):
+    """Set de _index de encuesta con contradicción a nivel cultivo:
+    producción=0 con área sembrada>0, o cosechada>sembrada (misma unidad)."""
+    if book is None:
+        return set()
+    rp = pick_sheet(book, "roster_parcela")
+    if rp is None or "_index" not in rp.columns:
+        return set()
+    p2enc = rp.drop_duplicates("_index").set_index("_index")["_parent_index"]
+    malos = set()
+    for sheet in ("roster_cultivo", "roster_cultivos"):
+        r = pick_sheet(book, sheet)
+        if r is None or "_parent_index" not in r.columns:
+            continue
+        semb = num(col(r, "area total sembrada"))
+        cos = num(col(r, "area total cosechada"))
+        prod = num(col(r, "la produccion de"))
+        us = col(r, ["M2_Q2b", "M2s_Q2b"], exact=True).astype(str)
+        uc = col(r, ["M2_Q3b", "M2s_Q3b"], exact=True).astype(str)
+        cond = ((semb > 0) & (prod == 0)) | ((us == uc) & (cos > semb))
+        encs = r.loc[cond, "_parent_index"].map(p2enc).dropna()
+        malos |= set(encs.tolist())
+    return malos
 
 
 def _cuenta_roster_por_encuesta(book, sheet, via_parcela=True):
@@ -349,6 +403,20 @@ def flags_agricola(d: pd.DataFrame, book: dict = None) -> pd.DataFrame:
                     or (not pd.isna(ratio) and (ratio > 3 or ratio < 1/3)))
             a2.at[i] = bool(malo)
     f["A2 Georreferenciación no confiable"] = a2
+
+    # X — contradicciones lógicas
+    edad = num(col(d, "edad del productor"))
+    G = (_drop9999(num(col(d, "compra de la SEMILLA"))).fillna(0)
+         + _drop9999(num(col(d, "compra de FERTILIZANTES"))).fillna(0)
+         + _drop9999(num(col(d, "AGROQUIMICOS"))).fillna(0)
+         + _drop9999(num(col(d, "mano de obra o jornales"))).fillna(0))
+    I = _drop9999(num(col(d, "ingreso total obtenido por la venta")))
+    contra = (((edad < 18) | (edad > 90))
+              | ((I > G * 10) & (G > 0) & I.notna()))
+    enc_bad = encuestas_contradiccion_cultivo(book)
+    if idx_c is not None and enc_bad:
+        contra = contra | d[idx_c].isin(enc_bad)
+    f["X Contradicción lógica (Agrícola)"] = contra.fillna(False)
     return f.fillna(False)
 
 
@@ -893,6 +961,129 @@ def seccion_reporte(d, flags, modulo):
 
 
 # ----------------------------------------------------------------------------
+# Estadísticas (preliminares) — por módulo y cruce territorial
+# ----------------------------------------------------------------------------
+def _pct(serie, cond):
+    v = serie.dropna()
+    if v.empty:
+        return "—"
+    return f"{cond(v.astype(str)).mean():.0%}"
+
+
+def tarjetas(items, por_fila=4):
+    for k in range(0, len(items), por_fila):
+        cols = st.columns(por_fila)
+        for c, (lab, val, *ayuda) in zip(cols, items[k:k + por_fila]):
+            c.metric(lab, val, help=ayuda[0] if ayuda else None)
+
+
+def stats_scall(d):
+    st.markdown("#### 💧 SCALL")
+    usa = col(d, "el hogar usa agua del SCALL")
+    mes = num(col(d, ["meses al año su scall aporta", "cuantos meses aporta agua"])).mask(lambda s: s == 99)
+    disp = col(d, "la disponibilidad de agua para beber es")
+    seg = col(d, "seguira funcionando dentro de 2")
+    fies = [c for c in d.columns if "por falta de dinero" in _norm(c)
+            or "ultimos tres meses" in _norm(c)]
+    inseg = (d[fies].apply(lambda r: (r.astype(str) == "Sí").any(), axis=1)
+             if fies else pd.Series(dtype=bool))
+    tarjetas([
+        ("Hogares que usan el agua del SCALL", _pct(usa, lambda v: v.str.startswith("Sí"))),
+        ("Meses/año de aporte (prom.)", f"{mes.mean():.1f}" if mes.notna().any() else "—"),
+        ("Perciben mejor disponibilidad de agua", _pct(disp, lambda v: v.isin(["Mejor", "Mucho mejor"]))),
+        ("Creen que funcionará en 2 años", _pct(seg, lambda v: v.str.startswith("Sí"))),
+        ("Con algún signo de inseguridad alimentaria (FIES)",
+         f"{inseg.mean():.0%}" if len(inseg) else "—",
+         "Al menos una respuesta afirmativa en la escala FIES."),
+    ], por_fila=5)
+
+
+def stats_agricola(d):
+    st.markdown("#### 🌾 Prácticas agrícolas")
+    sx = col(d, "sexo del productor")
+    ed = num(col(d, "edad del productor"))
+    hg = num(col(d, "personas habitan al dia de hoy"))
+    pa = num(col(d, "TERRENOS o PARCELAS"))
+    cu = num(col(d, "CULTIVOS tuvo en total"))
+    ing = num(col(d, "ingreso total obtenido por la venta")).mask(lambda s: s == 9999)
+    gs = num(col(d, "compra de la SEMILLA")).mask(lambda s: s == 9999)
+    fu = col(d, "principal fuente de ingresos").dropna().astype(str)
+    eca = col(d, "Escuela de Campo")
+    pf = col(d, "planes de finca")
+    moda = f"{fu.value_counts().index[0]} ({fu.value_counts().iloc[0]/len(fu):.0%})" if len(fu) else "—"
+    tarjetas([
+        ("Productoras mujeres", _pct(sx, lambda v: v == "Mujer")),
+        ("Edad promedio del productor", f"{ed.mean():.0f} años" if ed.notna().any() else "—"),
+        ("Tamaño promedio del hogar", f"{hg.mean():.1f}" if hg.notna().any() else "—"),
+        ("Parcelas por productor (prom.)", f"{pa.mean():.1f}" if pa.notna().any() else "—"),
+        ("Cultivos por productor (prom.)", f"{cu.mean():.1f}" if cu.notna().any() else "—"),
+        ("Vendieron parte de su cosecha",
+         f"{(ing > 0).sum()/ing.notna().sum():.0%}" if ing.notna().any() else "—"),
+        ("Ingreso por ventas (prom., >0)",
+         f"${ing[ing > 0].mean():.0f}" if (ing > 0).any() else "—"),
+        ("Gasto en semilla (prom., >0)",
+         f"${gs[gs > 0].mean():.0f}" if (gs > 0).any() else "—"),
+        ("Participaron en Escuela de Campo", _pct(eca, lambda v: v.str.startswith("Sí"))),
+        ("Participaron en planes de finca", _pct(pf, lambda v: v.str.startswith("Sí"))),
+    ], por_fila=5)
+    st.caption(f"Fuente principal de ingresos más común: **{moda}**.")
+
+
+def cruce_territorial(ds, da):
+    st.markdown("#### 🔗 Cruce territorial de las dos bases")
+    st.caption("Las encuestas SCALL y Prácticas son de **beneficiarios distintos** "
+               "(componentes diferentes del proyecto), por lo que no se pueden cruzar "
+               "a nivel de persona. Sí se comparan por territorio: dónde coincide la "
+               "cobertura de ambas intervenciones.")
+    ms = resolve(ds, "Municipio")
+    ma = resolve(da, "Municipio")
+    if ms is None or ma is None:
+        st.info("No se encontró la columna de municipio en alguna base.")
+        return
+    cs = ds[ms].dropna().astype(str).value_counts()
+    ca = da[ma].dropna().astype(str).value_counts()
+    muni = sorted(set(cs.index) | set(ca.index))
+    tabla = pd.DataFrame({
+        "Municipio": muni,
+        "Encuestas SCALL": [int(cs.get(m, 0)) for m in muni],
+        "Encuestas Prácticas": [int(ca.get(m, 0)) for m in muni],
+    })
+    tabla["Ambas intervenciones"] = np.where(
+        (tabla["Encuestas SCALL"] > 0) & (tabla["Encuestas Prácticas"] > 0), "✔", "")
+    ambos = int((tabla["Ambas intervenciones"] == "✔").sum())
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Municipios con SCALL", int((tabla["Encuestas SCALL"] > 0).sum()))
+    c2.metric("Municipios con Prácticas", int((tabla["Encuestas Prácticas"] > 0).sum()))
+    c3.metric("Municipios con ambas", ambos)
+    st.dataframe(tabla.sort_values(["Ambas intervenciones", "Encuestas SCALL"],
+                                   ascending=[False, False]),
+                 hide_index=True, width="stretch")
+
+
+def pestana_estadisticas():
+    st.subheader("📊 Estadísticas preliminares")
+    st.caption("Calculadas sobre las bases publicadas, sin depuración final ni "
+               "ponderación. Son referencia de avance, **no** resultados de la "
+               "evaluación.")
+    libros = {}
+    for mod_ in ("SCALL", "AGRICOLA"):
+        p = os.path.join(DATA_DIR, ARCHIVO[mod_])
+        if os.path.exists(p):
+            _, d = detect_module(libro_publicado(ARCHIVO[mod_], os.path.getmtime(p)))
+            libros[mod_] = d
+    if "SCALL" in libros:
+        stats_scall(libros["SCALL"])
+        st.divider()
+    if "AGRICOLA" in libros:
+        stats_agricola(libros["AGRICOLA"])
+        st.divider()
+    if "SCALL" in libros and "AGRICOLA" in libros:
+        cruce_territorial(libros["SCALL"], libros["AGRICOLA"])
+    elif not libros:
+        st.info("Aún no hay bases publicadas. Sube data/scall.xlsx y data/agricola.xlsx.")
+
+
+# ----------------------------------------------------------------------------
 # Render de un módulo
 # ----------------------------------------------------------------------------
 def render_modulo(book, esperado, nombre):
@@ -960,8 +1151,11 @@ if check_password():
     hero("Monitoreo de calidad — RECLIMA",
          "Evaluación final · corredor seco de El Salvador. Datos publicados por el "
          "administrador, sin información personal de los entrevistados.")
-    tab_scall, tab_agri = st.tabs(["💧 SCALL", "🌾 Agrícola"])
+    tab_scall, tab_agri, tab_stats = st.tabs(
+        ["💧 SCALL", "🌾 Agrícola", "📊 Estadísticas"])
     with tab_scall:
         pestana_modulo("SCALL", "SCALL", "scall")
     with tab_agri:
         pestana_modulo("AGRICOLA", "Agrícola", "agri")
+    with tab_stats:
+        pestana_estadisticas()
