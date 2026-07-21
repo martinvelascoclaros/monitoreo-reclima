@@ -4,3 +4,4 @@ numpy<3
 openpyxl
 plotly
 python-docx
+reportlab
