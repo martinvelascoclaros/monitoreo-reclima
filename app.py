@@ -170,7 +170,12 @@ def clave_encuesta_roster(r):
 def _kobo(d):
     kc = clave_encuesta_data(d)
     if kc is not None:
-        return d[kc].astype("Int64").astype(str)
+        s = d[kc]
+        # La llave puede ser numérica (Kobo _id: 22180444.0 -> 22180444) o de
+        # texto (columna INDEX creada por el usuario: "V3-R3"). No forzar entero.
+        if pd.api.types.is_numeric_dtype(s):
+            return s.astype("Int64").astype(str)
+        return s.astype(str).str.strip()
     return pd.Series((d.index + 1).astype(str), index=d.index)
 
 
@@ -804,97 +809,18 @@ def poligonos_sin_asignar(book):
 
 
 def seccion_poligonos_extra(d, book):
-    """Polígonos agregados manualmente (hoja Poligonos_SINASIGNAR): medición y
-    mapa. Se identifican por código de beneficiario; se intenta enlazar al área
-    declarada si el código coincide con el identificador de una encuesta."""
+    """Aviso de polígonos agregados manualmente (hoja Poligonos_SINASIGNAR) que
+    aún no se pueden vincular: su identificador no coincide con ninguna encuesta.
+    No se listan ni se mapean; solo se reporta la cantidad."""
     sin = poligonos_sin_asignar(book)
     if not sin:
         return
-    st.subheader("➕ Polígonos agregados manualmente")
-    st.caption("Polígonos cargados aparte (hoja Poligonos_SINASIGNAR), identificados "
-               "por código de beneficiario. Se miden por GPS; no provienen de la "
-               "encuesta, por eso no tienen precisión GPS registrada.")
-    # mapa código -> área declarada (si el código coincide con un identificador)
-    id_c = resolve(d, K_ID)
-    rp = pick_sheet(book, "roster_parcela")
-    ac = resolve(rp, "el area de") if rp is not None else None
-    uc = resolve(rp, "M1_Q6b", exact=True) if rp is not None else None
-    kc = clave_encuesta_data(d)
-    id2key = {}
-    if id_c is not None and kc is not None:
-        id2key = dict(zip(d[id_c].astype(str).str.strip(), d[kc].astype(str)))
-
-    regs, shapes = [], []
-    for cod, pts in sin:
-        am = area_poligono_m2(pts)
-        rep_txt, ratio = "—", np.nan
-        if cod in id2key and rp is not None and ac is not None:
-            mias = parcelas_de_encuesta(book, id2key[cod])
-            if mias is not None and len(mias):
-                ar = num(mias[ac]).iloc[0]
-                un = str(mias[uc].iloc[0]) if uc else ""
-                if not pd.isna(ar):
-                    rep_txt = f"{ar:g} {un}"
-                    fac = FACTOR_AREA.get(un)
-                    if fac and ar > 0:
-                        ratio = am / (ar * fac)
-        al = []
-        if len(pts) < 3:
-            al.append("< 3 vértices")
-        if am < 50:
-            al.append("área ≈ 0")
-        if not pd.isna(ratio) and (ratio > 3 or ratio < 1/3):
-            al.append(f"difiere de lo reportado (x{ratio:.1f})")
-        regs.append({
-            "Código beneficiario": cod, "Vértices": len(pts),
-            "Área medida (mz)": round(am / M2_POR_MANZANA, 2),
-            "Área medida (m²)": round(am),
-            "Área declarada": rep_txt,
-            "⚠ Revisar": "; ".join(al) if al else "✔",
-        })
-        shapes.append((cod, pts))
-    st.dataframe(pd.DataFrame(regs), hide_index=True, width="stretch")
-    sin_match = sum(1 for c, _ in sin if c not in id2key)
-    if sin_match:
-        st.caption(f"Nota: {sin_match} de {len(sin)} códigos no coinciden con ningún "
-                   "identificador de encuesta de la base actual, por lo que no se "
-                   "puede comparar contra el área declarada. Verificar que el código "
-                   "del polígono use el mismo formato que el PRODUCTOS-ID ENCUESTA.")
-
-    import plotly.graph_objects as go
-    usa = hasattr(go, "Scattermap")
-    estilo = selector_estilo("est_poly_extra")
-    fig = go.Figure()
-    for cod, pts in shapes:
-        la = [p[0] for p in pts] + [pts[0][0]]
-        lo = [p[1] for p in pts] + [pts[0][1]]
-        tr = dict(lat=la, lon=lo, mode="lines+markers", fill="toself",
-                  name=cod, hovertext=cod)
-        fig.add_trace(go.Scattermap(**tr) if usa else go.Scattermapbox(**tr))
-    centro = dict(lat=float(np.mean([p[0] for _, ps in shapes for p in ps])),
-                  lon=float(np.mean([p[1] for _, ps in shapes for p in ps])))
-    key = "map" if usa else "mapbox"
-    fig.update_layout(**{key: dict(style=estilo, center=centro, zoom=11)},
-                      height=480, margin=dict(l=0, r=0, t=10, b=0))
-    st.plotly_chart(fig, width="stretch")
-
-    st.markdown("**🔎 Ver un polígono agregado**")
-    ops = [c for c, _ in shapes]
-    sel = st.selectbox("Seleccione el código", ops, key="poly_extra_sel")
-    if sel not in dict(shapes):
-        sel = ops[0]
-    pts_sel = dict(shapes)[sel]
-    st.dataframe(pd.DataFrame([next((r for r in regs if r["Código beneficiario"] == sel), regs[0])]),
-                 hide_index=True, width="stretch")
-    la = [p[0] for p in pts_sel] + [pts_sel[0][0]]
-    lo = [p[1] for p in pts_sel] + [pts_sel[0][1]]
-    tr = dict(lat=la, lon=lo, mode="lines+markers", fill="toself", name=sel)
-    fig2 = go.Figure(go.Scattermap(**tr) if usa else go.Scattermapbox(**tr))
-    c2 = dict(lat=float(np.mean([p[0] for p in pts_sel])),
-              lon=float(np.mean([p[1] for p in pts_sel])))
-    fig2.update_layout(**{key: dict(style=estilo, center=c2, zoom=16)},
-                       height=440, margin=dict(l=0, r=0, t=10, b=0), showlegend=False)
-    st.plotly_chart(fig2, width="stretch")
+    st.info(
+        f"📍 **{len(sin)} polígonos no asignados aún.** Fueron medidos en el 4.º "
+        "enlace (link) de KoboToolbox y cargados aparte. El identificador colocado "
+        "a cada uno **no coincide con ningún PRODUCTOS-ID ENCUESTA** de la base, por "
+        "lo que todavía no pueden vincularse a un productor ni compararse contra su "
+        "área declarada. Pendiente de conciliar los códigos.")
 
 
 def ficha_encuestado(d, flags, book=None, modulo=""):
@@ -1071,42 +997,190 @@ def resumen_pdf(d, flags, modulo, extra=""):
     return buf.getvalue()
 
 
-def reporte_docx(d, flags, modulo, extra=""):
+def identificadores(d):
+    """DataFrame índice-alineado con INDEX (llave del usuario o Kobo) e
+    'Identificador de encuestado' (o 'No disponible' si falta)."""
+    kc = clave_encuesta_data(d)
+    idx = d[kc].astype(str).str.strip() if kc is not None else _kobo(d)
+    id_c = resolve(d, K_ID)
+    if id_c is not None:
+        raw = d[id_c].astype(str).str.strip()
+        ident = raw.mask(vacios(d[id_c]), "No disponible")
+    else:
+        ident = pd.Series("No disponible", index=d.index)
+    return pd.DataFrame({"INDEX": idx, "Identificador de encuestado": ident}, index=d.index)
+
+
+def analisis_poligonos(d, book):
+    """Lista de dicts con la medición y control de calidad de cada polígono de
+    parcela capturado en la encuesta. 'desconfiable' = tiene al menos un motivo."""
+    geo_c = resolve(d, "coordenadas de la esquina de la parcela")
+    if geo_c is None or book is None:
+        return []
+    ident = identificadores(d)
+    kc = clave_encuesta_data(d)
+    kd = d[kc].astype(str) if kc is not None else id_encuesta(d)
+    rp = pick_sheet(book, "roster_parcela")
+    ac = resolve(rp, "el area de") if rp is not None else None
+    uc = resolve(rp, "M1_Q6b", exact=True) if rp is not None else None
+    out = []
+    for i in d.index:
+        v = d.at[i, geo_c]
+        if not (isinstance(v, str) and ";" in str(v)):
+            continue
+        pts = parse_geoshape(v)
+        if not pts:
+            continue
+        am = area_poligono_m2(pts)
+        precs = [p[2] for p in pts if not pd.isna(p[2])]
+        prec = float(np.mean(precs)) if precs else np.nan
+        rep_txt, ratio = "—", np.nan
+        if rp is not None and ac is not None:
+            mias = parcelas_de_encuesta(book, kd.iloc[i])
+            if mias is not None and len(mias):
+                ar = num(mias[ac]).iloc[0]
+                un = str(mias[uc].iloc[0]) if uc else ""
+                if not pd.isna(ar):
+                    rep_txt = f"{ar:g} {un}"
+                    fac = FACTOR_AREA.get(un)
+                    if fac and ar > 0:
+                        ratio = am / (ar * fac)
+        motivos = []
+        if len(pts) < 3:
+            motivos.append("menos de 3 vértices")
+        if am < 50:
+            motivos.append("área casi nula (≈0)")
+        if not pd.isna(prec) and prec > 15:
+            motivos.append(f"precisión GPS mala ({prec:.0f} m)")
+        if not pd.isna(ratio) and (ratio > 3 or ratio < 1/3):
+            motivos.append(f"área medida difiere de la declarada (x{ratio:.1f})")
+        out.append({
+            "INDEX": ident.at[i, "INDEX"],
+            "Identificador": ident.at[i, "Identificador de encuestado"],
+            "Vertices": len(pts),
+            "Area_medida_mz": round(am / M2_POR_MANZANA, 2),
+            "Area_declarada": rep_txt,
+            "motivos": motivos,
+            "desconfiable": bool(motivos),
+        })
+    return out
+
+
+def reporte_docx(d, flags, modulo, extra="", book=None):
     from docx import Document
-    from docx.shared import Pt
+    from docx.shared import Pt, RGBColor
+    VERDE = RGBColor(0x1F, 0x5C, 0x2E)
+
     enum_c = resolve(d, K_ENUM)
     distr_c = resolve(d, "Distrito", exact=True) or resolve(d, "Distrito")
-    ids = id_encuesta(d)
+    ident = identificadores(d)
     fechas = pd.to_datetime(col(d, "Fecha de la entrevista"), errors="coerce").dt.date
     con = flags.any(axis=1)
+
     doc = Document()
     doc.styles["Normal"].font.size = Pt(10)
-    doc.add_heading(f"Reporte de campo — RECLIMA {modulo}", 0)
+
+    def _tab(headers, filas, widths=None):
+        t = doc.add_table(rows=1, cols=len(headers))
+        t.style = "Light Grid Accent 1"
+        for j, h in enumerate(headers):
+            r = t.rows[0].cells[j].paragraphs[0].add_run(h)
+            r.bold = True
+            r.font.size = Pt(8.5)
+        for fila in filas:
+            cs = t.add_row().cells
+            for j, val in enumerate(fila):
+                r = cs[j].paragraphs[0].add_run("" if val is None else str(val))
+                r.font.size = Pt(8.5)
+        return t
+
+    doc.add_heading(f"Reporte de análisis de campo — RECLIMA {modulo}", 0)
     fv = fechas.dropna()
     rango = f"Periodo: {fv.min():%d/%m/%Y} – {fv.max():%d/%m/%Y}   ·   " if len(fv) else ""
     doc.add_paragraph(rango + f"Generado: {datetime.now():%d/%m/%Y %H:%M}. "
-                      "Sin datos personales: registros identificados por PRODUCTOS-ID ENCUESTA.")
-    doc.add_heading("Banderas a atender", 1)
+                      "Documento sin datos personales; los registros se identifican por "
+                      "su INDEX y su PRODUCTOS-ID ENCUESTA.")
+
+    # 1. Resumen de campo
+    doc.add_heading("1. Resumen de campo", 1)
+    _tab(["Indicador", "Valor"], [
+        ["Encuestas", len(d)],
+        ["Encuestadores", d[enum_c].nunique() if enum_c else "—"],
+        ["Distritos", d[distr_c].nunique() if distr_c else "—"],
+        ["Días de campo", int(fechas.nunique())],
+        ["Encuestas con ≥1 bandera", f"{int(con.sum())} ({con.mean():.0%})" if len(d) else "0"],
+    ])
+
+    # 2. Estadísticas generales
+    doc.add_heading("2. Estadísticas generales (preliminares)", 1)
+    doc.add_paragraph("Cálculos sobre la base sin depuración final; referencia de avance, "
+                      "no resultados de la evaluación.")
+    _tab(["Estadística", "Valor"], [[l, v] for (l, v, *_) in stats_datos(d, modulo)])
+
+    # 3. Avance por día
+    doc.add_heading("3. Avance por día", 1)
+    por_dia = fechas.dropna().value_counts().sort_index()
+    _tab(["Día", "Encuestas"], [[f"{k:%d/%m/%Y}", int(v)] for k, v in por_dia.items()])
+
+    # 4. Banderas: total y significado
+    doc.add_heading("4. Banderas de calidad", 1)
     resumen = flags.sum()
     resumen = resumen[resumen > 0].sort_values(ascending=False)
     if resumen.empty:
         doc.add_paragraph("No hay banderas activas.")
     else:
-        for name, v in resumen.items():
-            afect = [f"#{ids.loc[i]}" for i in d.index[flags[name]]]
-            p = doc.add_paragraph()
-            p.add_run(f"{name} — {int(v)} caso(s). ").bold = True
-            p.add_run("IDs: " + ", ".join(afect))
-            if name in FLAG_DESC:
-                doc.add_paragraph(FLAG_DESC[name], style="Intense Quote")
+        _tab(["Bandera", "Casos", "% del total"],
+             [[k, int(v), f"{v/len(d):.0%}"] for k, v in resumen.items()])
+        doc.add_paragraph("Qué significa cada bandera activa:", style="Intense Quote")
+        for k in resumen.index:
+            if k in FLAG_DESC:
+                p = doc.add_paragraph()
+                p.add_run(f"{k}: ").bold = True
+                p.add_run(FLAG_DESC[k])
+
+    # 5. Registros por bandera (INDEX + identificador)
+    doc.add_heading("5. Registros de los que se desconfía, por bandera", 1)
+    if resumen.empty:
+        doc.add_paragraph("No hay registros con banderas.")
+    else:
+        for k in resumen.index:
+            doc.add_paragraph(f"{k} — {int(resumen[k])} caso(s)", style="Intense Quote")
+            filas = [[ident.at[i, "INDEX"], ident.at[i, "Identificador de encuestado"],
+                      d[enum_c].iloc[i] if enum_c else "—"]
+                     for i in d.index[flags[k]]]
+            _tab(["INDEX", "Identificador de encuestado", "Encuestador"], filas)
+
+    # 6. Polígonos desconfiables (solo Agrícola)
+    polys = analisis_poligonos(d, book) if modulo != "SCALL" else []
+    if polys:
+        doc.add_heading("6. Polígonos de parcela que no cuadran", 1)
+        malos = [p for p in polys if p["desconfiable"]]
+        doc.add_paragraph(
+            f"Se capturaron {len(polys)} polígonos de parcela. De ellos, {len(malos)} "
+            "resultan desconfiables según al menos uno de estos criterios: menos de 3 "
+            "vértices; área calculada casi nula (≈0); precisión GPS peor a 15 m; o área "
+            "medida que difiere más de 3 veces del área declarada por el productor.")
+        if malos:
+            _tab(["INDEX", "Identificador", "Vért.", "Área medida (mz)", "Área declarada", "Motivo"],
+                 [[p["INDEX"], p["Identificador"], p["Vertices"], p["Area_medida_mz"],
+                   p["Area_declarada"], "; ".join(p["motivos"])] for p in malos])
+        # nota de polígonos sin asignar
+        sin = poligonos_sin_asignar(book) if book else []
+        if sin:
+            doc.add_paragraph(
+                f"Además, {len(sin)} polígonos fueron cargados aparte (medidos en el 4.º "
+                "enlace de KoboToolbox) con un identificador que no coincide con ningún "
+                "PRODUCTOS-ID ENCUESTA de la base, por lo que aún no pueden vincularse.")
+
     if extra:
+        doc.add_heading("Observaciones", 1)
         doc.add_paragraph(extra)
     buf = io.BytesIO()
     doc.save(buf)
     return buf.getvalue()
 
 
-def seccion_reporte(d, flags, modulo):
+def seccion_reporte(d, flags, modulo, book=None):
     st.subheader("📤 Exportar")
     extra = st.text_input("Observaciones (opcional, se incluyen en los reportes)",
                           key=f"obs_{modulo}")
@@ -1123,7 +1197,7 @@ def seccion_reporte(d, flags, modulo):
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         key=f"xl_{modulo}", width="stretch")
     c3.download_button(
-        "📝 Reporte (.docx)", data=reporte_docx(d, flags, modulo, extra),
+        "📝 Reporte (.docx)", data=reporte_docx(d, flags, modulo, extra, book=book),
         file_name=f"Reporte_RECLIMA_{modulo}_{hoy}.docx",
         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         key=f"doc_{modulo}", width="stretch")
@@ -1149,29 +1223,27 @@ def tarjetas(items, por_fila=4):
             c.metric(lab, val, help=ayuda[0] if ayuda else None)
 
 
-def stats_scall(d):
-    st.markdown("#### 💧 SCALL")
-    usa = col(d, "el hogar usa agua del SCALL")
-    mes = num(col(d, ["meses al año su scall aporta", "cuantos meses aporta agua"])).mask(lambda s: s == 99)
-    disp = col(d, "la disponibilidad de agua para beber es")
-    seg = col(d, "seguira funcionando dentro de 2")
-    fies = [c for c in d.columns if "por falta de dinero" in _norm(c)
-            or "ultimos tres meses" in _norm(c)]
-    inseg = (d[fies].apply(lambda r: (r.astype(str) == "Sí").any(), axis=1)
-             if fies else pd.Series(dtype=bool))
-    tarjetas([
-        ("Hogares que usan el agua del SCALL", _pct(usa, lambda v: v.str.startswith("Sí"))),
-        ("Meses/año de aporte (prom.)", f"{mes.mean():.1f}" if mes.notna().any() else "—"),
-        ("Perciben mejor disponibilidad de agua", _pct(disp, lambda v: v.isin(["Mejor", "Mucho mejor"]))),
-        ("Creen que funcionará en 2 años", _pct(seg, lambda v: v.str.startswith("Sí"))),
-        ("Con algún signo de inseguridad alimentaria (FIES)",
-         f"{inseg.mean():.0%}" if len(inseg) else "—",
-         "Al menos una respuesta afirmativa en la escala FIES."),
-    ], por_fila=5)
-
-
-def stats_agricola(d):
-    st.markdown("#### 🌾 Prácticas agrícolas")
+def stats_datos(d, modulo):
+    """Lista de (etiqueta, valor) de estadísticas preliminares del módulo.
+    Se usa tanto en el tablero como en el reporte Word."""
+    if modulo == "SCALL":
+        usa = col(d, "el hogar usa agua del SCALL")
+        mes = num(col(d, ["meses al año su scall aporta", "cuantos meses aporta agua"])).mask(lambda s: s == 99)
+        disp = col(d, "la disponibilidad de agua para beber es")
+        seg = col(d, "seguira funcionando dentro de 2")
+        fies = [c for c in d.columns if "por falta de dinero" in _norm(c)
+                or "ultimos tres meses" in _norm(c)]
+        inseg = (d[fies].apply(lambda r: (r.astype(str) == "Sí").any(), axis=1)
+                 if fies else pd.Series(dtype=bool))
+        return [
+            ("Hogares que usan el agua del SCALL", _pct(usa, lambda v: v.str.startswith("Sí"))),
+            ("Meses/año de aporte (prom.)", f"{mes.mean():.1f}" if mes.notna().any() else "—"),
+            ("Perciben mejor disponibilidad de agua", _pct(disp, lambda v: v.isin(["Mejor", "Mucho mejor"]))),
+            ("Creen que funcionará en 2 años", _pct(seg, lambda v: v.str.startswith("Sí"))),
+            ("Con algún signo de inseguridad alimentaria (FIES)",
+             f"{inseg.mean():.0%}" if len(inseg) else "—",
+             "Al menos una respuesta afirmativa en la escala FIES."),
+        ]
     sx = col(d, "sexo del productor")
     ed = num(col(d, "edad del productor"))
     hg = num(col(d, "personas habitan al dia de hoy"))
@@ -1182,8 +1254,7 @@ def stats_agricola(d):
     fu = col(d, "principal fuente de ingresos").dropna().astype(str)
     eca = col(d, "Escuela de Campo")
     pf = col(d, "planes de finca")
-    moda = f"{fu.value_counts().index[0]} ({fu.value_counts().iloc[0]/len(fu):.0%})" if len(fu) else "—"
-    tarjetas([
+    items = [
         ("Productoras mujeres", _pct(sx, lambda v: v == "Mujer")),
         ("Edad promedio del productor", f"{ed.mean():.0f} años" if ed.notna().any() else "—"),
         ("Tamaño promedio del hogar", f"{hg.mean():.1f}" if hg.notna().any() else "—"),
@@ -1191,14 +1262,29 @@ def stats_agricola(d):
         ("Cultivos por productor (prom.)", f"{cu.mean():.1f}" if cu.notna().any() else "—"),
         ("Vendieron parte de su cosecha",
          f"{(ing > 0).sum()/ing.notna().sum():.0%}" if ing.notna().any() else "—"),
-        ("Ingreso por ventas (prom., >0)",
-         f"${ing[ing > 0].mean():.0f}" if (ing > 0).any() else "—"),
-        ("Gasto en semilla (prom., >0)",
-         f"${gs[gs > 0].mean():.0f}" if (gs > 0).any() else "—"),
+        ("Ingreso por ventas (prom., >0)", f"${ing[ing > 0].mean():.0f}" if (ing > 0).any() else "—"),
+        ("Gasto en semilla (prom., >0)", f"${gs[gs > 0].mean():.0f}" if (gs > 0).any() else "—"),
         ("Participaron en Escuela de Campo", _pct(eca, lambda v: v.str.startswith("Sí"))),
         ("Participaron en planes de finca", _pct(pf, lambda v: v.str.startswith("Sí"))),
-    ], por_fila=5)
-    st.caption(f"Fuente principal de ingresos más común: **{moda}**.")
+    ]
+    if len(fu):
+        items.append(("Fuente principal de ingresos (moda)",
+                      f"{fu.value_counts().index[0]} ({fu.value_counts().iloc[0]/len(fu):.0%})"))
+    return items
+
+
+def stats_scall(d):
+    st.markdown("#### 💧 SCALL")
+    tarjetas(stats_datos(d, "SCALL"), por_fila=5)
+
+
+def stats_agricola(d):
+    st.markdown("#### 🌾 Prácticas agrícolas")
+    items = stats_datos(d, "AGRICOLA")
+    moda = next((v for l, v, *_ in items if "Fuente principal" in l), None)
+    tarjetas([it for it in items if "Fuente principal" not in it[0]], por_fila=5)
+    if moda:
+        st.caption(f"Fuente principal de ingresos más común: **{moda}**.")
 
 
 def cruce_territorial(ds, da):
@@ -1302,7 +1388,7 @@ def render_modulo(book, esperado, nombre):
     st.divider()
     _seccion("Mapa de puntos GPS", seccion_mapa, d, esperado)
     st.divider()
-    _seccion("Exportar", seccion_reporte, d, flags, mod_)
+    _seccion("Exportar", seccion_reporte, d, flags, mod_, book)
     st.divider()
     _seccion("Ficha de la encuesta", ficha_encuestado, d, flags,
              book if esperado == "AGRICOLA" else None, esperado)
