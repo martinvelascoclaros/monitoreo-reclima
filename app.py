@@ -139,10 +139,43 @@ def vacios(serie: pd.Series) -> pd.Series:
     return serie.isna() | serie.astype(str).str.strip().isin(["", "nan", "None", "<NA>"])
 
 
+# Nombres posibles de una llave única creada por el usuario para unir las
+# bases (DATA con los rosters). Si existe, tiene prioridad sobre la de Kobo.
+K_LLAVE_DATA = ["INDEX", "ID_ENCUESTA", "ID ENCUESTA", "llave", "key_encuesta"]
+K_LLAVE_ROSTER = ["INDEX", "ID_ENCUESTA", "ID ENCUESTA", "llave", "key_encuesta"]
+
+
+def clave_encuesta_data(d):
+    """Columna con la llave ÚNICA de encuesta en DATA. Prioriza una llave
+    creada por el usuario (INDEX/ID_ENCUESTA); si no, usa el _id de Kobo
+    (único). Evita _index, que se repite al mezclar versiones del formulario."""
+    for k in K_LLAVE_DATA:
+        c = resolve(d, k, exact=True)
+        if c is not None and d[c].nunique(dropna=True) == d[c].notna().sum():
+            return c
+    return resolve(d, "_id", exact=True) or resolve(d, "_index", exact=True)
+
+
+def clave_encuesta_roster(r):
+    """Columna del roster que referencia a la encuesta padre. Prioriza la
+    llave del usuario (INDEX/ID_ENCUESTA); si no, usa _submission__id de Kobo
+    (== _id de DATA), globalmente único a diferencia de _parent_index."""
+    for k in K_LLAVE_ROSTER:
+        c = resolve(r, k, exact=True)
+        if c is not None:
+            return c
+    return resolve(r, "_submission__id", exact=True)
+
+
+def _kobo(d):
+    kc = clave_encuesta_data(d)
+    if kc is not None:
+        return d[kc].astype("Int64").astype(str)
+    return pd.Series((d.index + 1).astype(str), index=d.index)
+
+
 def id_encuesta(d: pd.DataFrame) -> pd.Series:
-    idx_c = resolve(d, "_index", exact=True)
-    kobo = (d[idx_c].astype("Int64").astype(str) if idx_c
-            else pd.Series((d.index + 1).astype(str), index=d.index))
+    kobo = _kobo(d)
     id_c = resolve(d, K_ID)
     if id_c is not None:
         raw = d[id_c]
@@ -243,10 +276,13 @@ FLAG_DESC = {
         "puede vincular la encuesta con el marco muestral de beneficiarios ni dar "
         "seguimiento. Se corrige recuperando el ID con el encuestador.",
     "A1 Módulo productivo incompleto":
-        "El productor declaró tener parcelas o cultivos, pero el roster de cultivos "
-        "(área sembrada, producción, rendimiento) está vacío o no coincide con lo "
-        "declarado. Es el dato central de la evaluación agrícola: sin él no se puede "
-        "medir productividad. Revisar por qué no se registró el detalle de cultivos.",
+        "El roster capturó MENOS parcelas o cultivos de los que el productor declaró "
+        "(o el roster de cultivos quedó vacío pese a declarar cultivos). Falta el "
+        "detalle productivo (área sembrada, producción, rendimiento), que es el dato "
+        "central de la evaluación agrícola: sin él no se puede medir productividad. "
+        "Revisar por qué no se registró el detalle. No marca los casos donde el "
+        "roster tiene más filas que lo declarado (un cultivo en varias parcelas "
+        "genera varias filas y no es un error).",
     "A2 Georreferenciación no confiable":
         "El polígono de la parcela es incoherente: su área calculada por GPS difiere "
         "más de 3 veces del área declarada, o es una geometría degenerada (menos de 3 "
@@ -301,18 +337,14 @@ def flags_scall(d: pd.DataFrame, book: dict = None) -> pd.DataFrame:
 
 
 def encuestas_contradiccion_cultivo(book):
-    """Set de _index de encuesta con contradicción a nivel cultivo:
-    producción=0 con área sembrada>0, o cosechada>sembrada (misma unidad)."""
+    """Set de llaves de encuesta (_submission__id) con contradicción a nivel
+    cultivo: producción=0 con área sembrada>0, o cosechada>sembrada."""
     if book is None:
         return set()
-    rp = pick_sheet(book, "roster_parcela")
-    if rp is None or "_index" not in rp.columns:
-        return set()
-    p2enc = rp.drop_duplicates("_index").set_index("_index")["_parent_index"]
     malos = set()
-    for sheet in ("roster_cultivo", "roster_cultivos"):
-        r = pick_sheet(book, sheet)
-        if r is None or "_parent_index" not in r.columns:
+    for r in hojas_cultivo(book):
+        k = clave_encuesta_roster(r)
+        if k is None:
             continue
         semb = num(col(r, "area total sembrada"))
         cos = num(col(r, "area total cosechada"))
@@ -320,51 +352,81 @@ def encuestas_contradiccion_cultivo(book):
         us = col(r, ["M2_Q2b", "M2s_Q2b"], exact=True).astype(str)
         uc = col(r, ["M2_Q3b", "M2s_Q3b"], exact=True).astype(str)
         cond = ((semb > 0) & (prod == 0)) | ((us == uc) & (cos > semb))
-        encs = r.loc[cond, "_parent_index"].map(p2enc).dropna()
-        malos |= set(encs.tolist())
+        malos |= set(r.loc[cond, k].astype(str).tolist())
     return malos
 
 
-def _cuenta_roster_por_encuesta(book, sheet, via_parcela=True):
+def contar_roster_por_encuesta(book, sheet):
+    """Filas del roster por encuesta, contadas con la llave de encuesta."""
     r = pick_sheet(book, sheet)
-    if r is None or "_parent_index" not in r.columns:
+    if r is None:
         return pd.Series(dtype=int)
-    if via_parcela:
-        rp = pick_sheet(book, "roster_parcela")
-        if rp is None or "_index" not in rp.columns:
-            return pd.Series(dtype=int)
-        p2enc = rp.drop_duplicates("_index").set_index("_index")["_parent_index"]
-        return r["_parent_index"].map(p2enc).dropna().value_counts()
-    return r["_parent_index"].value_counts()
+    k = clave_encuesta_roster(r)
+    if k is None:
+        return pd.Series(dtype=int)
+    return r[k].astype(str).value_counts()
+
+
+def hojas_cultivo(book):
+    """Hojas de cultivos ÚNICAS. Según la versión de la exportación puede
+    existir 'roster_cultivo', 'roster_cultivos' o ambas; se evita contar dos
+    veces la misma hoja (el matcher por subcadena las confunde)."""
+    vistas, out = set(), []
+    for cand in ("roster_cultivo", "roster_cultivos"):
+        r = pick_sheet(book, cand)
+        if r is not None and id(r) not in vistas:
+            vistas.add(id(r))
+            out.append(r)
+    return out
+
+
+def contar_cultivos_por_encuesta(book):
+    total = pd.Series(dtype=float)
+    for r in hojas_cultivo(book):
+        k = clave_encuesta_roster(r)
+        if k is None:
+            continue
+        total = total.add(r[k].astype(str).value_counts(), fill_value=0)
+    return total
+
+
+def parcelas_de_encuesta(book, id_val):
+    """Filas de roster_parcela cuya encuesta padre es id_val (usa _submission__id)."""
+    rp = pick_sheet(book, "roster_parcela")
+    if rp is None:
+        return None
+    k = clave_encuesta_roster(rp)
+    if k is None:
+        return rp.iloc[0:0]
+    return rp[rp[k].astype(str) == str(id_val)]
 
 
 def flags_agricola(d: pd.DataFrame, book: dict = None) -> pd.DataFrame:
     f = pd.DataFrame(index=d.index)
     f["Q Sin identificador (no trazable)"] = vacios(col(d, K_ID))
 
-    idx_c = resolve(d, "_index", exact=True)
+    kc = clave_encuesta_data(d)
+    kd = d[kc].astype(str) if kc is not None else id_encuesta(d)
     dec_p = num(col(d, "TERRENOS o PARCELAS"))
     dec_c = num(col(d, "CULTIVOS tuvo en total"))
 
     # A1 — módulo productivo incompleto
     a1 = pd.Series(False, index=d.index)
-    if book is not None and idx_c is not None:
-        rp = pick_sheet(book, "roster_parcela")
-        pcount = (rp.groupby("_parent_index").size()
-                  if rp is not None and "_parent_index" in rp.columns else pd.Series(dtype=int))
-        ccount = _cuenta_roster_por_encuesta(book, "roster_cultivo")
-        ccount2 = _cuenta_roster_por_encuesta(book, "roster_cultivos")
-        cpe = ccount.add(ccount2, fill_value=0)
+    if book is not None:
+        pcount = contar_roster_por_encuesta(book, "roster_parcela")
+        cpe = contar_cultivos_por_encuesta(book)
         for i in d.index:
-            ix = d.at[i, idx_c]
-            real_p = pcount.get(ix, 0)
-            real_c = cpe.get(ix, 0)
-            dp, dc = dec_p.get(i), dec_c.get(i)
-            declaro_cult = (not pd.isna(dc)) and dc > 0
-            sin_cult = real_c == 0
-            descuadre = ((not pd.isna(dp) and dp != real_p) or
-                         (not pd.isna(dc) and dc != real_c))
-            a1.at[i] = (declaro_cult and sin_cult) or descuadre
+            k = kd.iloc[i]
+            real_p = pcount.get(k, 0)
+            real_c = cpe.get(k, 0)
+            dp, dc = dec_p.iloc[i], dec_c.iloc[i]
+            # Marca solo FALTA de información: el roster capturó menos parcelas
+            # o menos cultivos de los que el productor declaró (incluye vacío).
+            # No marca cuando el roster tiene más (un cultivo en varias parcelas
+            # genera varias filas y no es un error).
+            falta_parc = (not pd.isna(dp)) and real_p < dp
+            falta_cult = (not pd.isna(dc)) and real_c < dc
+            a1.iloc[i] = bool(falta_parc or falta_cult)
     f["A1 Módulo productivo incompleto"] = a1
 
     # A2 — georreferenciación no confiable
@@ -381,7 +443,7 @@ def flags_agricola(d: pd.DataFrame, book: dict = None) -> pd.DataFrame:
                         and str(d.at[i, aut_c]).strip().startswith("Sí"))
             tiene_poly = isinstance(v, str) and ";" in str(v)
             if autorizo and not tiene_poly:
-                a2.at[i] = True
+                a2.iloc[i] = True
                 continue
             if not tiene_poly:
                 continue
@@ -390,9 +452,9 @@ def flags_agricola(d: pd.DataFrame, book: dict = None) -> pd.DataFrame:
             precs = [p[2] for p in pts if not pd.isna(p[2])]
             prec = float(np.mean(precs)) if precs else np.nan
             ratio = np.nan
-            if rp is not None and idx_c is not None and ac is not None:
-                mias = rp[rp["_parent_index"] == d.at[i, idx_c]]
-                if len(mias):
+            if rp is not None and ac is not None:
+                mias = parcelas_de_encuesta(book, kd.iloc[i])
+                if mias is not None and len(mias):
                     ar = num(mias[ac]).iloc[0]
                     un = str(mias[uc].iloc[0]) if uc else ""
                     fac = FACTOR_AREA.get(un)
@@ -401,7 +463,7 @@ def flags_agricola(d: pd.DataFrame, book: dict = None) -> pd.DataFrame:
             malo = (len(pts) < 3 or am < 50
                     or (not pd.isna(prec) and prec > 15)
                     or (not pd.isna(ratio) and (ratio > 3 or ratio < 1/3)))
-            a2.at[i] = bool(malo)
+            a2.iloc[i] = bool(malo)
     f["A2 Georreferenciación no confiable"] = a2
 
     # X — contradicciones lógicas
@@ -414,8 +476,8 @@ def flags_agricola(d: pd.DataFrame, book: dict = None) -> pd.DataFrame:
     contra = (((edad < 18) | (edad > 90))
               | ((I > G * 10) & (G > 0) & I.notna()))
     enc_bad = encuestas_contradiccion_cultivo(book)
-    if idx_c is not None and enc_bad:
-        contra = contra | d[idx_c].isin(enc_bad)
+    if enc_bad:
+        contra = contra | kd.isin(enc_bad)
     f["X Contradicción lógica (Agrícola)"] = contra.fillna(False)
     return f.fillna(False)
 
@@ -633,7 +695,8 @@ def seccion_poligonos(d, book):
     if geo_c is None:
         return
     ids = id_encuesta(d)
-    idx_c = resolve(d, "_index", exact=True)
+    kc = clave_encuesta_data(d)
+    kd = d[kc].astype(str) if kc is not None else id_encuesta(d)
     rp = pick_sheet(book, "roster_parcela")
     ac = resolve(rp, "el area de") if rp is not None else None
     uc = resolve(rp, "M1_Q6b", exact=True) if rp is not None else None
@@ -650,9 +713,9 @@ def seccion_poligonos(d, book):
         precs = [p[2] for p in pts if not pd.isna(p[2])]
         prec = float(np.mean(precs)) if precs else np.nan
         rep_txt, ratio = "—", np.nan
-        if rp is not None and idx_c is not None and ac is not None:
-            mias = rp[rp["_parent_index"] == d.at[i, idx_c]]
-            if len(mias):
+        if rp is not None and ac is not None:
+            mias = parcelas_de_encuesta(book, kd.iloc[i])
+            if mias is not None and len(mias):
                 ar = num(mias[ac]).iloc[0]
                 un = str(mias[uc].iloc[0]) if uc else ""
                 if not pd.isna(ar):
@@ -726,9 +789,7 @@ def ficha_encuestado(d, flags, book=None, modulo=""):
     st.caption("Identificada solo por ID (sin datos personales). Los campos de nombres, "
                "teléfonos, direcciones y coordenadas están excluidos del tablero.")
     ids = id_encuesta(d)
-    idx_c = resolve(d, "_index", exact=True)
-    kobo = (d[idx_c].astype("Int64").astype(str) if idx_c
-            else pd.Series((d.index + 1).astype(str), index=d.index))
+    kobo = _kobo(d)
     etiquetas = ids.where(ids.str.startswith("s/ID"), ids + " · k" + kobo)
     elegido = st.selectbox("Seleccione la encuesta por ID", etiquetas, key=f"ficha_{modulo}")
     m = etiquetas == elegido
@@ -743,14 +804,12 @@ def ficha_encuestado(d, flags, book=None, modulo=""):
     ficha.index.name = "Pregunta"
     st.dataframe(ficha.rename("Respuesta").to_frame().astype(str),
                  width="stretch", height=440)
-    if book is not None and idx_c is not None:
-        rp = pick_sheet(book, "roster_parcela")
-        if rp is not None and "_parent_index" in rp.columns:
-            mias = rp[rp["_parent_index"] == d.at[i, idx_c]]
-            if len(mias):
-                st.markdown(f"**🌾 Parcelas de esta encuesta ({len(mias)})**")
-                st.dataframe(quitar_sensibles(mias).dropna(axis=1, how="all").astype(str),
-                             width="stretch", hide_index=True)
+    if book is not None:
+        mias = parcelas_de_encuesta(book, kobo.loc[i])
+        if mias is not None and len(mias):
+            st.markdown(f"**🌾 Parcelas de esta encuesta ({len(mias)})**")
+            st.dataframe(quitar_sensibles(mias).dropna(axis=1, how="all").astype(str),
+                         width="stretch", hide_index=True)
 
 
 # ----------------------------------------------------------------------------
@@ -1086,31 +1145,53 @@ def pestana_estadisticas():
 # ----------------------------------------------------------------------------
 # Render de un módulo
 # ----------------------------------------------------------------------------
+def _seccion(nombre_seccion, fn, *args):
+    """Ejecuta una sección aislando errores: si una falla, muestra un aviso
+    con el detalle y el resto del tablero sigue funcionando."""
+    try:
+        fn(*args)
+    except Exception as e:
+        import traceback
+        st.warning(f"⚠ No se pudo mostrar la sección «{nombre_seccion}»: {e}")
+        with st.expander("Ver detalle técnico"):
+            st.code(traceback.format_exc())
+
+
 def render_modulo(book, esperado, nombre):
     detectado, d = detect_module(book)
     if detectado and detectado != esperado:
         st.error(f"Este archivo parece del módulo **{detectado}**, no de {nombre}. "
                  "Súbelo en la otra pestaña.")
         return
-    flags = calcular_flags(d, esperado, book)
+    # Índice de fila único (las bases con varias versiones traen _index repetido)
+    d = d.reset_index(drop=True)
+    try:
+        flags = calcular_flags(d, esperado, book)
+    except Exception as e:
+        import traceback
+        st.error(f"No se pudieron calcular las banderas: {e}")
+        st.code(traceback.format_exc())
+        flags = pd.DataFrame(index=d.index)
     claves = CLAVES_SCALL if esperado == "SCALL" else CLAVES_AGRI
-    kpis(d, flags)
+    mod_ = "SCALL" if esperado == "SCALL" else "Agrícola"
+    _seccion("Indicadores", kpis, d, flags)
     st.divider()
-    resumen_banderas(d, flags)
+    _seccion("Resumen de banderas", resumen_banderas, d, flags)
     st.divider()
-    avance_campo(d)
+    _seccion("Avance de campo", avance_campo, d)
     st.divider()
-    tabla_flags(d, flags)
-    seccion_faltantes(d, claves)
+    _seccion("Registros con banderas", tabla_flags, d, flags)
+    _seccion("Valores faltantes", seccion_faltantes, d, claves)
     if esperado == "AGRICOLA":
         st.divider()
-        seccion_poligonos(d, book)
+        _seccion("Polígonos de parcela", seccion_poligonos, d, book)
     st.divider()
-    seccion_mapa(d, esperado)
+    _seccion("Mapa de puntos GPS", seccion_mapa, d, esperado)
     st.divider()
-    seccion_reporte(d, flags, "SCALL" if esperado == "SCALL" else "Agrícola")
+    _seccion("Exportar", seccion_reporte, d, flags, mod_)
     st.divider()
-    ficha_encuestado(d, flags, book if esperado == "AGRICOLA" else None, esperado)
+    _seccion("Ficha de la encuesta", ficha_encuestado, d, flags,
+             book if esperado == "AGRICOLA" else None, esperado)
 
 
 # ----------------------------------------------------------------------------
