@@ -5,14 +5,12 @@ Publica los datos el administrador (carpeta data/ del repo); el equipo
 consulta con enlace + contraseña. El tablero NO muestra datos personales
 de los entrevistados (solicitud FAO): solo el ID (PRODUCTOS-ID ENCUESTA).
 
-Banderas sustantivas (derivadas del análisis de calidad, jul 2026):
-  Q   Registro no trazable — sin identificador (ambos)
-  S   Composición del hogar incompleta (SCALL)
-  X   Contradicción lógica (ambos módulos)
-  A1a Sin cultivos capturados (Agrícola)
-  A1b Roster productivo incompleto — menos de lo declarado (Agrícola)
-  A2  Polígono pendiente de medir (Agrícola)
-  A3  Medida del polígono muy diferente a la declarada (Agrícola)
+Banderas sustantivas (letras A, B, C… por módulo, jul 2026):
+  SCALL:    A Sin identificador · B Composición del hogar incompleta ·
+            C Contradicción lógica
+  Agrícola: A Sin identificador · B Sin cultivos capturados ·
+            C Roster productivo incompleto · D Polígono pendiente ·
+            E Medida del polígono muy diferente · F Contradicción lógica
 """
 
 import io
@@ -317,42 +315,45 @@ def area_poligono_m2(pts) -> float:
 # BANDERAS SUSTANTIVAS
 # ----------------------------------------------------------------------------
 FLAG_DESC = {
-    "Q Sin identificador (no trazable)":
+    # A — común a ambos módulos
+    "A Sin identificador (no trazable)":
         "El registro no tiene el PRODUCTOS-ID ENCUESTA. Sin ese identificador no se "
         "puede vincular la encuesta con el marco muestral de beneficiarios ni dar "
         "seguimiento. Se corrige recuperando el ID con el encuestador.",
-    "A1a Sin cultivos capturados":
+    # SCALL — B, C
+    "B Composición del hogar incompleta":
+        "Falta la composición del hogar (total de personas, mujeres, hombres). Puede "
+        "deberse a la lógica de salto del formulario o a una omisión; conviene "
+        "verificar contra el XLSForm si el bloque debía desplegarse para este caso.",
+    "C Contradicción lógica":
+        "Hay respuestas internamente contradictorias: (a) dice usar el agua del SCALL "
+        "pero reporta 0 meses de aporte al año; (b) responde que NO tiene un SCALL "
+        "instalado, pese a estar en la muestra SCALL (posible problema de elegibilidad "
+        "o de captura); o (c) mujeres + hombres no suman el total de personas del "
+        "hogar. Revisar el registro para identificar cuál dato es el incorrecto.",
+    # Agrícola — B, C, D, E, F
+    "B Sin cultivos capturados":
         "El productor declaró tener cultivos, pero el roster de cultivos está "
         "completamente VACÍO: no se registró ninguno (sin área sembrada, producción "
         "ni rendimiento). Es la pérdida más grave del dato productivo, central para "
         "la evaluación agrícola. Revisar por qué no se levantó ningún cultivo.",
-    "A1b Roster productivo incompleto":
+    "C Roster productivo incompleto":
         "El roster capturó ALGO pero MENOS de lo que el productor declaró: menos "
         "cultivos, o menos parcelas de las declaradas. Falta parte del detalle "
         "productivo. No marca cuando el roster tiene más filas que lo declarado (un "
         "cultivo repartido en varias parcelas genera varias filas y no es un error).",
-    "A2 Polígono pendiente":
+    "D Polígono pendiente":
         "El productor autorizó registrar el polígono de la parcela, pero éste quedó "
         "marcado como PENDIENTE: aún no se ha medido en campo. Es un pendiente "
         "operativo del levantamiento, no un error de dato.",
-    "A3 Medida del polígono muy diferente":
+    "E Medida del polígono muy diferente":
         "El área del polígono medida por GPS (en metros cuadrados) es muy diferente "
         "del área que declaró el productor, una vez convertida a metros cuadrados "
         "según su unidad (manzanas, tareas, hectáreas o varas). Se marca cuando la "
         "medida difiere más de 3 veces de la declarada, o cuando la geometría es "
         "degenerada (menos de 3 vértices o área casi nula). Sugiere un error de trazo "
         "del polígono o de la superficie declarada; verificar en campo.",
-    "S Composición del hogar incompleta":
-        "Falta la composición del hogar (total de personas, mujeres, hombres). Puede "
-        "deberse a la lógica de salto del formulario o a una omisión; conviene "
-        "verificar contra el XLSForm si el bloque debía desplegarse para este caso.",
-    "X Contradicción lógica (SCALL)":
-        "Hay respuestas internamente contradictorias: (a) dice usar el agua del SCALL "
-        "pero reporta 0 meses de aporte al año; (b) responde que NO tiene un SCALL "
-        "instalado, pese a estar en la muestra SCALL (posible problema de elegibilidad "
-        "o de captura); o (c) mujeres + hombres no suman el total de personas del "
-        "hogar. Revisar el registro para identificar cuál dato es el incorrecto.",
-    "X Contradicción lógica (Agrícola)":
+    "F Contradicción lógica":
         "Hay respuestas internamente contradictorias: (a) edad del productor menor a 18 "
         "o mayor a 90; (b) ingreso por ventas mayor a 10 veces el total de gastos "
         "productivos (rentabilidad implausible, algún monto mal capturado); (c) un "
@@ -368,7 +369,7 @@ def _drop9999(s):
 
 def flags_scall(d: pd.DataFrame, book: dict = None) -> pd.DataFrame:
     f = pd.DataFrame(index=d.index)
-    f["Q Sin identificador (no trazable)"] = vacios(col(d, K_ID))
+    f["A Sin identificador (no trazable)"] = vacios(col(d, K_ID))
     T = num(col(d, "personas habitan al dia de hoy"))
     M = num(col(d, "cuantas son mujeres"))
     H = num(col(d, "cuantas son hombres"))
@@ -376,7 +377,7 @@ def flags_scall(d: pd.DataFrame, book: dict = None) -> pd.DataFrame:
                                     "cuantas son mujeres", "cuantas son hombres"]]
     comp = [c for c in comp if c is not None]
     if comp:
-        f["S Composición del hogar incompleta"] = pd.concat(
+        f["B Composición del hogar incompleta"] = pd.concat(
             [vacios(d[c]) for c in comp], axis=1).any(axis=1)
     # X — contradicciones lógicas
     usa = col(d, "el hogar usa agua del SCALL").astype(str)
@@ -386,7 +387,7 @@ def flags_scall(d: pd.DataFrame, book: dict = None) -> pd.DataFrame:
     contra = ((usa.str.startswith("Sí") & (mes == 0))
               | inst.str.startswith("No")
               | (T.notna() & M.notna() & H.notna() & ((M + H) != T)))
-    f["X Contradicción lógica (SCALL)"] = contra.fillna(False)
+    f["C Contradicción lógica"] = contra.fillna(False)
     return f.fillna(False)
 
 
@@ -457,14 +458,14 @@ def parcelas_de_encuesta(book, id_val):
 
 def flags_agricola(d: pd.DataFrame, book: dict = None) -> pd.DataFrame:
     f = pd.DataFrame(index=d.index)
-    f["Q Sin identificador (no trazable)"] = vacios(col(d, K_ID))
+    f["A Sin identificador (no trazable)"] = vacios(col(d, K_ID))
 
     kc = clave_encuesta_data(d)
     kd = d[kc].astype(str) if kc is not None else id_encuesta(d)
     dec_p = num(col(d, "TERRENOS o PARCELAS"))
     dec_c = num(col(d, "CULTIVOS tuvo en total"))
 
-    # A1a — sin ningún cultivo capturado ; A1b — capturó menos de lo declarado
+    # B — sin ningún cultivo capturado ; C — capturó menos de lo declarado
     a1a = pd.Series(False, index=d.index)
     a1b = pd.Series(False, index=d.index)
     if book is not None:
@@ -475,17 +476,17 @@ def flags_agricola(d: pd.DataFrame, book: dict = None) -> pd.DataFrame:
             real_p = pcount.get(k, 0)
             real_c = cpe.get(k, 0)
             dp, dc = dec_p.iloc[i], dec_c.iloc[i]
-            # A1a: declaró cultivos pero el roster de cultivos está VACÍO (0).
+            # B: declaró cultivos pero el roster de cultivos está VACÍO (0).
             sin_cult = (not pd.isna(dc)) and dc > 0 and real_c == 0
-            # A1b: capturó ALGO pero menos de lo declarado (cultivos o parcelas).
+            # C: capturó ALGO pero menos de lo declarado (cultivos o parcelas).
             #      No marca cuando el roster tiene más (un cultivo en varias
             #      parcelas genera varias filas y no es un error).
             menos = (((not pd.isna(dc)) and 0 < real_c < dc)
                      or ((not pd.isna(dp)) and real_p < dp))
             a1a.iloc[i] = bool(sin_cult)
             a1b.iloc[i] = bool(menos)
-    f["A1a Sin cultivos capturados"] = a1a
-    f["A1b Roster productivo incompleto"] = a1b
+    f["B Sin cultivos capturados"] = a1a
+    f["C Roster productivo incompleto"] = a1b
 
     # A2 — polígono pendiente ; A3 — medida del polígono muy diferente
     geo_c = resolve(d, "coordenadas de la esquina de la parcela")
@@ -521,8 +522,8 @@ def flags_agricola(d: pd.DataFrame, book: dict = None) -> pd.DataFrame:
                        or (not pd.isna(decl_m2) and decl_m2 > 0
                            and (am / decl_m2 > 3 or am / decl_m2 < 1/3)))
             a3.iloc[i] = bool(muy_dif)
-    f["A2 Polígono pendiente"] = a2
-    f["A3 Medida del polígono muy diferente"] = a3
+    f["D Polígono pendiente"] = a2
+    f["E Medida del polígono muy diferente"] = a3
 
     # X — contradicciones lógicas
     edad = num(col(d, "edad del productor"))
@@ -536,7 +537,7 @@ def flags_agricola(d: pd.DataFrame, book: dict = None) -> pd.DataFrame:
     enc_bad = encuestas_contradiccion_cultivo(book)
     if enc_bad:
         contra = contra | kd.isin(enc_bad)
-    f["X Contradicción lógica (Agrícola)"] = contra.fillna(False)
+    f["F Contradicción lógica"] = contra.fillna(False)
     return f.fillna(False)
 
 
