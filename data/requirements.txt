@@ -1,7 +1,0 @@
-streamlit>=1.36
-pandas>=2.0,<3
-numpy<3
-openpyxl
-plotly
-python-docx
-reportlab
